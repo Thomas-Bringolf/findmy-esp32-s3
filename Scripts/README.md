@@ -71,7 +71,7 @@ nothing until it is reset.
 | `devices` | list paired devices |
 | `test` | console protocol edge cases (resets the device) |
 | `power` | awake/sleep duty cycle from the `PWR` telemetry |
-| `retrieve` | fetch location reports (`--bg`/`--status`/`--follow`/`--stop`) |
+| `retrieve` | fetch location reports (`--bg`/`--status`/`--doctor`/`--follow`/`--stop`) |
 | `watch` | retrieve and keep polling |
 | `monitor` | live dashboard over `reports.json` |
 | `verify` | is our key on air? |
@@ -213,6 +213,7 @@ reports medians, min/max and the awake duty cycle (see
 ./findmy-toolbox.py retrieve you@example.com        # first login (password + 2FA)
 ./findmy-toolbox.py retrieve --bg           # background worker, loop every 90 s
 ./findmy-toolbox.py retrieve --status       # is the worker running?
+./findmy-toolbox.py retrieve --doctor       # do known reports still come back?
 ./findmy-toolbox.py retrieve --follow       # tail its log
 ./findmy-toolbox.py retrieve --stop         # stop it
 ./findmy-toolbox.py watch --interval 120    # foreground polling
@@ -221,13 +222,28 @@ reports medians, min/max and the awake duty cycle (see
 Incremental fetch for every beacon in `devices.json`: one request per slot
 (Apple caps batched responses), starting at the newest slot that already has
 archived reports and never more than `--back` (30) slots back. Results are
-appended to `state/reports.json` (deduplicated).
+appended to `state/reports.json` (deduplicated), each keeping the hash of the
+key it was fetched under.
+
+If the worker was down it does **not** silently skip the slots nobody
+queried: it remembers the highest slot it reached and resumes there (capped
+at 720 slots / 24 h), so a laptop that slept through the night still catches
+the reports uploaded during that gap.
+
+`--doctor` is the positive control for "is my Apple ID banned?": it re-asks
+Apple for keys we already hold reports for. Those reports are fresh enough
+to be on the server, so *any* answer back means the session still reads
+reports, while "none of the known keys came back" is the signature of a
+banned or throttled account (or of a beacon nobody has seen). It needs one
+report fetched after this build to be armed, because older archive entries
+have no key hash.
 
 `--bg` double-forks into a daemon that holds an `flock` on
 `state/retrieve.lock`, so only one worker ever runs. The first login asks
 for password + 2FA and saves the session; afterwards runs are
 credential-free until the session expires (delete
-`state/account_state.json` to force a login).
+`state/account_state.json` to force a login). It replaces the archived
+`old/retrieve_loop.sh`, which called a script that no longer exists.
 
 ### monitor / verify / scan
 
@@ -325,8 +341,8 @@ apple   : connected as you@example.com
 and the entries change with them:
 
 * **no console connected** → only the commands that do not need UART
-  (`devices`, `sync-ble`, `retrieve`, `watch`, `monitor`, `verify`, `scan`,
-  `log`, `help`), plus `connect` and `reset`, plus `apple connect`;
+  (`devices`, `sync-ble`, `retrieve`, `doctor`, `watch`, `monitor`, `verify`,
+  `scan`, `log`, `help`), plus `connect` and `reset`, plus `apple connect`;
 * **connected** → the console commands appear (`sync`, `test`, `power`,
   `pin`, `pair`, `wipe`, `disconnect`, `reset`), each already bound to the
   connected device's `--id`/`--port`;

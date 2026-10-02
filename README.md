@@ -178,7 +178,7 @@ cd Scripts
 | `devices` | list paired beacons |
 | `test` | hardware-in-the-loop protocol suite (resets the device) |
 | `power` | awake/sleep duty cycle from the `PWR` telemetry |
-| `retrieve` | fetch location reports (`--bg` / `--status` / `--follow` / `--stop`) |
+| `retrieve` | fetch location reports (`--bg` / `--status` / `--doctor` / `--follow` / `--stop`) |
 | `watch` / `monitor` | polling loop / live dashboard |
 | `verify` / `scan` | is our key on air? / raw Find&nbsp;My packet dump |
 | `pin` / `unlock` / `lock` | console PIN management |
@@ -242,7 +242,7 @@ holds an `flock` so only one instance ever runs.
 | `findmy-toolbox.py test` | ✅ **79/79** (twice) |
 | `sync` / `sync-ble` / `verify` / `scan` | ✅ slot matched from the advertisement |
 | `power --seconds 45` | ✅ 0.37&nbsp;% awake, 23 cycles |
-| `retrieve` (+ `--bg`/`--status`/`--follow`/`--stop`) | ✅ session restored, worker guarded |
+| `retrieve` (+ `--bg`/`--status`/`--doctor`/`--follow`/`--stop`) | ✅ session restored, worker guarded, gap-safe window |
 | `connect` / `disconnect` / `reset` / menu | ✅ name lookup, PIN trial, state-driven menu |
 | `apple-id connect` / `disconnect` | ✅ session saved and deleted again |
 | `monitor` / `watch` / `log` | ✅ |

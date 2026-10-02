@@ -25,6 +25,15 @@ this pass; the rest are proposals.
   (`IDENT?` is answered **while locked**), toolbox `connect` / `disconnect` /
   `reset`, `apple-id connect|disconnect`, and a menu that only offers what the
   current connections allow.
+- Retrieval made trustworthy: the worker remembers the newest slot it
+  reached and resumes there after an outage (capped at 24 h) instead of
+  silently skipping everything older than `--back`; an empty Apple body is
+  logged and retried instead of swallowed; every report archives the key
+  hash it was fetched under, which arms `retrieve --doctor` (positive
+  control for "is this Apple ID banned?"); `reports.json` is written
+  atomically and the menu survives archive entries it cannot parse.
+  Replaces `Scripts/old/retrieve_loop.sh`, which had been calling a
+  trashed script since the repository cleanup.
 
 ## Power
 

@@ -172,6 +172,14 @@ Manual / ad-hoc (open a console session with TB unlock --reset, then):
     is missing/expired (first login: password + 2FA)
 [ ] incremental: the query window starts at the newest archived slot and
     never goes back more than --back (30) slots
+[ ] TB retrieve --doctor with no hashed keys in the archive -> rc 1 and
+    "no hashed keys archived yet" (it must not touch the network)
+[ ] TB retrieve --doctor after one report -> "Apple returned N of M known
+    report key(s) ... not banned", rc 0; a server that answers nothing
+    fresh reports -> FAIL, rc 1
+[ ] after a pause longer than --back the next fetch logs "worker gap -
+    fetching the slots nobody has queried since slot N" and the window
+    starts at N instead of skipping ahead
 [ ] one request per slot (Apple caps batched responses) - visible at -v
 [ ] TB retrieve --watch 30      -> keeps polling, Ctrl-C stops
 [ ] TB watch --interval 5       -> same, own interval
@@ -255,8 +263,8 @@ Manual / ad-hoc (open a console session with TB unlock --reset, then):
   9. Scripts/findmy-toolbox.py verify 15 && Scripts/findmy-toolbox.py scan 15
  10. Scripts/findmy-toolbox.py power --dbg-sec 60 --seconds 45
  11. Scripts/findmy-toolbox.py unlock --reset && Scripts/findmy-toolbox.py lock
- 12. Scripts/findmy-toolbox.py retrieve   (then --bg / --status / --follow /
-     --stop) and: apple-id status / connect / disconnect --yes
+ 12. Scripts/findmy-toolbox.py retrieve   (then --doctor / --bg / --status /
+     --follow / --stop) and: apple-id status / connect / disconnect --yes
  13. Scripts/findmy-toolbox.py monitor --once
  14. Scripts/findmy-toolbox.py log --lines 20
  15. grep -c "<current PIN>" Scripts/state/toolbox.log   # must be 0

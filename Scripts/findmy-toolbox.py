@@ -18,7 +18,7 @@ Commands:
     devices    list paired devices
     test       console protocol test suite (resets the device)
     power      awake/sleep duty cycle from the PWR telemetry
-    retrieve   fetch location reports  (--bg/--status/--follow/--stop)
+    retrieve   fetch location reports  (--bg/--status/--doctor/--follow)
     watch      retrieve and keep polling
     monitor    live dashboard
     verify     check the advertisement on air
@@ -46,6 +46,7 @@ import logging.handlers
 import os
 import re
 import secrets
+import shlex
 import signal
 import statistics
 import string
@@ -71,6 +72,7 @@ DEFAULT_SCAN_SECS = 15
 DEFAULT_SECS = 60
 DEFAULT_DEVICE = ""
 MAX_BACKTRACK_SLOTS = 30
+MAX_WINDOW_SLOTS = 720       # never look further back than this (24 h of slots)
 RETRIEVE_SLEEP_S = 90
 PIN_LEN = 8
 PIN_FAIL_MAX = 5           # firmware FM_PIN_FAIL_MAX (before a lockout)
@@ -468,6 +470,16 @@ def parse_time(value: str) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def report_time(report) -> datetime | None:
+    """Timestamp of an archived report, or None if the entry is unusable."""
+    if not isinstance(report, dict):
+        return None
+    try:
+        return parse_time(report["time"])
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def reply_of(raw: str) -> str | None:
@@ -1456,23 +1468,23 @@ def load_results() -> dict:
 
 def save_results(results: dict) -> None:
     STATE_DIR.mkdir(exist_ok=True)
-    REPORTS_JSON.write_text(json.dumps(results, indent=2) + "\n")
-    try:
-        REPORTS_JSON.chmod(0o600)
-    except OSError:
-        pass
+    tmp = REPORTS_JSON.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(results, indent=2) + "\n")
+    tmp.chmod(0o600)
+    tmp.replace(REPORTS_JSON)
 
 
-def report_to_dict(r, slot: int, ktype) -> dict:
+def report_to_dict(r, slot: int, key) -> dict:
     return {
         "slot": slot,
-        "type": ktype.name.lower(),
+        "type": key.key_type.name.lower(),
         "time": r.timestamp.isoformat(),
         "latitude": r.latitude,
         "longitude": r.longitude,
         "accuracy_m": r.horizontal_accuracy,
         "confidence": r.confidence,
         "status": r.status,
+        "key_hash": key.hashed_adv_key_b64,
     }
 
 
@@ -1496,11 +1508,21 @@ async def fetch_new_reports(account, acc, dev_id: str, results: dict,
     else:
         start = floor
 
+    resume = state.get("fetched_upto")
+    if resume is not None:
+        if start > resume:
+            log(channel, f"{dev_id}: worker gap - fetching the slots nobody "
+                         f"has queried since slot {resume}")
+        start = min(start, resume)
+    start = max(start, max_i - MAX_WINDOW_SLOTS)
+    start = max(0, min(start, max_i))
+
     log(channel, f"{dev_id}: query window slots {start}..{max_i} "
                  f"({max_i - start + 1} request(s), archive has "
                  f"{len(state['reports'])} report(s))")
 
     fresh = []
+    failed = []
     for slot in range(max_i, start - 1, -1):
         keys = {}
         for key in acc.keys_at(slot):
@@ -1508,6 +1530,10 @@ async def fetch_new_reports(account, acc, dev_id: str, results: dict,
         try:
             raw = await account.fetch_raw_reports([(list(keys.keys()), [])])
         except EmptyResponseError:
+            failed.append(slot)
+            log(channel, f"{dev_id}: slot {slot}: Apple answered with an "
+                         f"empty body - retrying this slot next cycle",
+                 logging.WARNING)
             raw = []
 
         added = 0
@@ -1516,7 +1542,7 @@ async def fetch_new_reports(account, acc, dev_id: str, results: dict,
             if key is None:
                 continue
             r.decrypt(key)
-            d = report_to_dict(r, slot, key.key_type)
+            d = report_to_dict(r, slot, key)
             k = report_key(d)
             if k not in known:
                 known.add(k)
@@ -1531,9 +1557,94 @@ async def fetch_new_reports(account, acc, dev_id: str, results: dict,
         save_results(results)
         await asyncio.sleep(0.2)
 
+    state["fetched_upto"] = min(failed) if failed else max_i
     state["reports"].sort(key=lambda d: d["time"])
     save_results(results)
     return fresh
+
+
+async def retrieve_doctor(apple_id: str | None, channel: str) -> int:
+    """Re-ask Apple for report keys we already hold.
+
+    A working session hands those reports back; a banned or throttled one
+    answers with nothing, which is otherwise indistinguishable from "no
+    beacon was ever seen".
+    """
+    from findmy.errors import EmptyResponseError
+
+    results = load_results()
+    wanted = {}
+    times = []
+    for dev_id, state in results.items():
+        if not isinstance(state, dict):
+            continue
+        for rep in state.get("reports") or []:
+            if not isinstance(rep, dict):
+                continue
+            h = rep.get("key_hash")
+            if h:
+                wanted.setdefault(h, set()).add(dev_id)
+                if isinstance(rep.get("time"), str) and rep["time"]:
+                    times.append(rep["time"])
+    if not wanted:
+        log_error(channel, "no hashed keys in the archive - fetch one report "
+                           "first, then --doctor can act as a positive control")
+        ui("no hashed keys archived yet (reports fetched before this build).")
+        ui("Fetch one report first, then re-run retrieve --doctor.")
+        return 1
+
+    times.sort()
+    if times:
+        log(channel, f"positive control over {len(wanted)} known report key(s), "
+                     f"archive spans {times[0]} .. {times[-1]}")
+    account = await apple_login(apple_id, channel)
+    if account is None:
+        return 1
+
+    seen = set()
+    empty = False
+    try:
+        hashes = sorted(wanted)
+        for i in range(0, len(hashes), 50):
+            try:
+                raw = await account.fetch_raw_reports([(hashes[i:i + 50], [])])
+            except EmptyResponseError:
+                empty = True
+                raw = []
+            for r in raw:
+                seen.add(base64.b64encode(r.hashed_adv_key_bytes).decode())
+            await asyncio.sleep(0.2)
+    finally:
+        try:
+            await account.close()
+        except Exception:
+            pass
+
+    devices = sorted({d for devs in wanted.values() for d in devs})
+    if seen:
+        ui(f"PASS: Apple returned {len(seen)} of {len(wanted)} known report "
+           f"key(s) for {', '.join(devices)}")
+        ui("  the session can read reports - the account is not banned")
+        return 0
+    if empty:
+        ui("INCONCLUSIVE: Apple answered with an empty body (known server "
+           "side hiccup) - run this again")
+        return 1
+    stamps = []
+    for stamp in times:
+        try:
+            stamps.append(parse_time(stamp))
+        except ValueError:
+            continue
+    if stamps and datetime.now(timezone.utc) - max(stamps) > timedelta(days=7):
+        ui("INCONCLUSIVE: every archived report is older than the 7 day "
+           "server window - fetch a fresh report first")
+        return 1
+    ui(f"FAIL: Apple returned none of the {len(wanted)} known report key(s)")
+    ui("  reports this fresh should still be on the server, so either the "
+       "account")
+    ui("  cannot read reports any more, or the beacon stopped being seen")
+    return 1
 
 
 async def apple_login(apple_id: str | None, channel: str):
@@ -1875,6 +1986,9 @@ def cmd_retrieve(args) -> int:
         return retrieve_follow(args.lines)
     if args.bg:
         return retrieve_start_bg()
+    if args.doctor:
+        log(channel, "checking that known reports still come back")
+        return asyncio.run(retrieve_doctor(args.apple_id, channel))
 
     watch = args.watch or 0
     log(channel, f"fetching reports (watch={watch})")
@@ -1932,15 +2046,20 @@ def render_monitor(device_id: str | None) -> str:
         if not reports:
             out.append("  " + p(DIM, "no reports yet"))
             continue
+        usable = [r for r in reports if report_time(r) is not None]
+        times = [report_time(r) for r in usable]
+        if not times:
+            out.append("  " + p(DIM, "no usable reports yet"))
+            continue
 
-        newest = max(parse_time(r["time"]) for r in reports)
+        newest = max(times)
         age = (now - newest).total_seconds()
         col = freshness_color(age)
         out.append("  " + p(BOLD, "FRESHNESS") + "  " +
                    p(col + BOLD, fmt_age(age)) + p(col, " since last report") +
                    "  " + p(DIM, f"(report from "
                                  f"{newest.astimezone().strftime('%H:%M:%S')}, "
-                                 f"slot {max(r['slot'] for r in reports)})"))
+                                 f"slot {max(r['slot'] for r in usable)})"))
         bar_w = 40
         filled = int(bar_w * min(1.0, age / FRESH_WARN))
         out.append("  " + p(col, "█" * filled + "░" * (bar_w - filled)))
@@ -1948,9 +2067,10 @@ def render_monitor(device_id: str | None) -> str:
         out.append("  " + p(MAGENTA + BOLD, "── latest reports " + "─" * 36))
         out.append("  " + p(DIM, f"{'slot':>5}  {'time (local)':<8}  {'age':>8}  "
                                  f"{'lat':>10}  {'lon':>10}  {'acc':>6}"))
-        for r in sorted(reports, key=lambda x: x["time"])[-8:]:
-            t = parse_time(r["time"]).astimezone()
-            r_age = fmt_age((now - parse_time(r["time"])).total_seconds())
+        for r in sorted(usable, key=lambda x: x["time"])[-8:]:
+            stamp = report_time(r)
+            t = stamp.astimezone()
+            r_age = fmt_age((now - stamp).total_seconds())
             out.append(f"  {r['slot']:>5}  {t.strftime('%H:%M:%S'):<8}  "
                        f"{r_age:>8}  {r['latitude']:>10.5f}  "
                        f"{r['longitude']:>10.5f}  "
@@ -2750,6 +2870,7 @@ findmy-toolbox.py - everything for the ESP32-S3 Find My beacon
                --status   is the worker running?
                --follow   tail the retrieval log
                --stop     stop the background worker
+               --doctor   do known reports still come back?
   watch      retrieve and keep polling (default every 120 s)
   monitor    live dashboard (Ctrl-C to quit)
   verify     check the advertisement on air
@@ -2817,32 +2938,33 @@ COMMAND_CHANNEL = {
 # The menu is built from these: the first group never needs the console, the
 # last one only appears with a connection (or offers 'connect' without one).
 MENU_ALWAYS = [
-    ("devices", "list paired devices", []),
-    ("sync-ble", "sync the slot counter from BLE", []),
-    ("retrieve", "fetch location reports", []),
-    ("watch", "retrieve + keep polling", []),
-    ("monitor", "live dashboard", []),
-    ("verify", "check the advertisement on air", []),
-    ("scan", "raw BLE scan", []),
-    ("log", "show or follow toolbox.log", []),
-    ("help", "show the command overview", []),
+    ("devices", "list paired devices", ["devices"]),
+    ("sync-ble", "sync the slot counter from BLE", ["sync-ble"]),
+    ("retrieve", "fetch location reports", ["retrieve"]),
+    ("doctor", "account check: known reports return", ["retrieve", "--doctor"]),
+    ("watch", "retrieve + keep polling", ["watch"]),
+    ("monitor", "live dashboard", ["monitor"]),
+    ("verify", "check the advertisement on air", ["verify"]),
+    ("scan", "raw BLE scan", ["scan"]),
+    ("log", "show or follow toolbox.log", ["log"]),
+    ("help", "show the command overview", ["help"]),
 ]
 
 MENU_CONSOLE = [
-    ("sync", "sync the slot counter (USB)", []),
-    ("test", "console protocol test suite", []),
-    ("power", "awake/sleep duty cycle", []),
-    ("pin", "set a new console PIN", []),
-    ("pair", "re-pair the connected beacon (new keys)", ["--force"]),
-    ("wipe", "factory reset: erase keys + PIN", []),
-    ("disconnect", "lock the console, drop the connection", []),
+    ("sync", "sync the slot counter (USB)", ["sync"]),
+    ("test", "console protocol test suite", ["test"]),
+    ("power", "awake/sleep duty cycle", ["power"]),
+    ("pin", "set a new console PIN", ["pin"]),
+    ("pair", "re-pair the connected beacon (new keys)", ["pair", "--force"]),
+    ("wipe", "factory reset: erase keys + PIN", ["wipe"]),
+    ("disconnect", "lock the console, drop the connection", ["disconnect"]),
 ]
 
 
 def menu_sections(conn: dict | None) -> list[tuple[str, list[tuple]]]:
     """(title, entries) for the current connection state. Every entry's argv
     is complete: [command, ...its own flags]."""
-    always = [(name, description, [name] + argv)
+    always = [(name, description, argv)
               for name, description, argv in MENU_ALWAYS]
     apple = session_account_name()
     if apple:
@@ -2854,7 +2976,7 @@ def menu_sections(conn: dict | None) -> list[tuple[str, list[tuple]]]:
                           ["apple-id", "connect"])]
     if conn:
         common = ["--id", conn["id"], "--port", conn["port"]]
-        uart = [(name, description, [name] + argv + common)
+        uart = [(name, description, argv + common)
                 for name, description, argv in MENU_CONSOLE]
         uart.append(("reset", "reboot the connected beacon",
                      ["reset", "--port", conn["port"]]))
@@ -2874,16 +2996,23 @@ def status_lines(conn: dict | None = None) -> list[str]:
     except UserError as exc:
         return [p(RED, f"devices.json: {exc}")]
     results = load_json(REPORTS_JSON)
+    if not isinstance(results, dict):
+        results = {}
     info = retrieve_running_info()
 
     newest_age = None
     report_count = 0
+    now = datetime.now(timezone.utc)
     for state in results.values():
-        reports = state.get("reports", [])
+        if not isinstance(state, dict):
+            continue
+        reports = state.get("reports")
+        if not isinstance(reports, list):
+            continue
         report_count += len(reports)
-        if reports:
-            age = (datetime.now(timezone.utc)
-                   - max(parse_time(r["time"]) for r in reports)).total_seconds()
+        times = [t for t in (report_time(r) for r in reports) if t is not None]
+        if times:
+            age = (now - max(times)).total_seconds()
             newest_age = age if newest_age is None else min(newest_age, age)
 
     worker = p(DIM, "stopped")
@@ -2941,7 +3070,8 @@ def menu() -> int:
                 print()
             print("   0) quit")
             print()
-            choice = input(p(BOLD, "> ")).strip().lower()
+            raw = input(p(BOLD, "> ")).strip()
+            choice = raw.lower()
             if choice in ("0", "q", "quit", "exit"):
                 log("UI", "menu closed")
                 return 0
@@ -2953,8 +3083,15 @@ def menu() -> int:
                     if choice == item[0]:
                         picked = item
                         break
-            if picked is None and choice in COMMANDS:
-                picked = (choice, "", [choice])   # type any command by hand
+            if picked is None and raw:
+                try:
+                    typed = shlex.split(raw)
+                except ValueError:
+                    typed = raw.split()
+                if typed and typed[0] not in COMMANDS:
+                    typed[0] = typed[0].lower()
+                if typed and typed[0] in COMMANDS:
+                    picked = (typed[0], "", typed)  # type a command by hand
             if picked is None:
                 print(p(RED, f"unknown choice '{choice}'"))
                 time.sleep(1.0)
@@ -3093,6 +3230,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help="run a background worker")
     retrieve.add_argument("--status", action="store_true",
                           help="report the worker state")
+    retrieve.add_argument("--doctor", action="store_true",
+                          help="re-fetch known reports (account check)")
     retrieve.add_argument("--follow", action="store_true",
                           help="tail the retrieval log")
     retrieve.add_argument("--stop", action="store_true",
