@@ -320,10 +320,13 @@ credential-free until the session expires (delete
 ```
 
 `monitor` shows the accessory status byte of the newest report — `0x00
-(locked+sleep-cycle)` green, `UNLOCKED` yellow, `CONFIG` red — then time
-since the last report (green ≤ 45 min / yellow ≤ 3 h / red), the latest
-reports with slot, age, position and accuracy, and a per-slot coverage
-strip. The screen is one window frame: title in the top border, the worker
+(locked+sleep-cycle)` green, `UNLOCKED` yellow, `CONFIG` red — then a
+per-bit breakdown: one line for each defined status bit (`unlocked`,
+`config`, `lowbatt`) with its current value and how long it has been in
+that state (a `≥` prefix means the archive only gives a lower bound). Then
+time since the last report (green ≤ 45 min / yellow ≤ 3 h / red), the
+latest reports with slot, age, position and accuracy, and a per-slot
+coverage strip. The screen is one window frame: title in the top border, the worker
 state, device count and clock on the right of it, the key hints in the
 bottom border. The freshness line carries a progress bar filled relative to
 the 3 h warning threshold, with the percentage next to it. Every fetched

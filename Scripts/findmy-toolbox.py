@@ -517,7 +517,7 @@ OF_LEN = 0x19
 OF_HEADER = 2
 APPLE_MFR = 0x004C
 OF_MFR_LEN = OF_HEADER + OF_LEN
-STATUS_BITS = 0x03
+STATUS_BITS = 0x07  # FM_STATUS_UNLOCKED | FM_STATUS_CONFIG | FM_STATUS_LOWBATT
 
 
 def legacy_mac(key) -> str:
@@ -597,7 +597,7 @@ def frame_spec_checks(mac: str, mfr: bytes) -> list[tuple[str, bool, str]]:
         add("random static address: top two bits are 0b11",
             first & 0xC0 == 0xC0, f"first octet {first:#04x}")
     if len(mfr) == OF_MFR_LEN:
-        add("status byte uses only defined bits (0x03)",
+        add("status byte uses only defined bits (0x07)",
             mfr[2] & ~STATUS_BITS == 0, f"status {status_decode(mfr[2])}")
         add("hint byte is 0x00", mfr[26] == 0, f"hint {mfr[26]:#04x}")
     return checks
@@ -677,6 +677,51 @@ def status_summary(reports: list[dict]) -> dict | None:
     raw, text = report_status(newest)
     return {"status": raw, "text": text, "slot": newest.get("slot"),
             "time": newest["time"]}
+
+
+STATUS_BIT_NAMES = ((0x01, "unlocked"),
+                    (0x02, "config"),
+                    (0x04, "lowbatt"))
+
+
+def status_bit_history(reports: list[dict], now) -> list[dict]:
+    """Per status bit: its current value and how long it has held it.
+
+    Walks the time-ordered reports so each bit reports the last moment it
+    changed. A bit with no observable change in the archive only has a
+    lower bound (the newest report), so its duration is marked with
+    ``certain=False``.
+    """
+    known = []
+    for r in reports:
+        if not isinstance(r.get("status"), int):
+            continue
+        stamp = report_time(r)
+        if stamp is not None:
+            known.append((stamp, r["status"]))
+    by_time = sorted(known, key=lambda kv: kv[0])
+    cur = 0
+    last_change = {mask: by_time[0][0] if by_time else None for mask, _ in
+                   STATUS_BIT_NAMES}
+    changed = {mask: False for mask, _ in STATUS_BIT_NAMES}
+    for stamp, byte in by_time:
+        for mask, _ in STATUS_BIT_NAMES:
+            val = bool(byte & mask)
+            if val != bool(cur & mask):
+                cur = (cur & ~mask) | (mask if val else 0)
+                last_change[mask] = stamp
+                changed[mask] = True
+    rows = []
+    for mask, name in STATUS_BIT_NAMES:
+        val = bool(cur & mask)
+        since = last_change[mask]
+        if since is None:
+            seconds = None
+        else:
+            seconds = (now - since).total_seconds()
+        rows.append({"mask": mask, "name": name, "value": val,
+                     "seconds": seconds, "certain": changed[mask]})
+    return rows
 
 
 def fmt_age(seconds: float) -> str:
@@ -2596,11 +2641,24 @@ def render_monitor(device_id: str | None) -> str:
                                        ).total_seconds())
                 except (TypeError, ValueError, OverflowError):
                     pass
+            raw_status = st.get("status")
             out.append("  " + p(BOLD, "STATUS") + "  " +
-                       p(status_color(st.get("status")) + BOLD,
+                       p(status_color(raw_status) + BOLD,
                          st.get("text") or "?") + "  " +
                        p(DIM, f"slot {st.get('slot', '?')}, "
                               f"report {age_str} ago"))
+            for row in status_bit_history(reports, now):
+                col = GREEN if not row["value"] else (
+                    MAGENTA if row["name"] == "lowbatt"
+                    else (RED if row["name"] == "config" else YELLOW))
+                label = ("ON " if row["value"] else "off") + f" {row['name']}"
+                if row["seconds"] is None:
+                    hold = "no data"
+                else:
+                    mark = "" if row["certain"] else "≥ "
+                    hold = f"{mark}{fmt_age(row['seconds'])}"
+                out.append(f"    · {p(col, label):<24}"
+                           f"{p(DIM, '(' + hold + ')')}")
         if not reports:
             out.append("  " + p(DIM, "no reports yet"))
             continue
