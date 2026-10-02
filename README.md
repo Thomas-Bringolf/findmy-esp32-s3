@@ -171,6 +171,7 @@ cd Scripts
 | `watch` / `monitor` | polling loop / live dashboard |
 | `verify` / `scan` | is our key on air? / raw Find&nbsp;My packet dump |
 | `pin` / `unlock` / `lock` | console PIN management |
+| `wipe` | factory reset: erase keys + PIN and unpair the device |
 | `log` | show or follow the rotating toolbox log |
 
 Full flag reference: [Scripts/README.md](Scripts/README.md).

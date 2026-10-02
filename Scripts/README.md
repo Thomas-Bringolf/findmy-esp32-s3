@@ -53,7 +53,7 @@ A device still on the factory PIN is in **config mode** — it never sleeps
 until `pin` sets a real one.
 
 Commands that need the console (`pair`, `sync`, `power`, `pin`, `unlock`,
-`lock`) accept `--reset`, which pulses the reset line first — a paired
+`lock`, `wipe`) accept `--reset`, which pulses the reset line first — a paired
 device whose countdown has expired is in its sleep loop and answers
 nothing until it is reset.
 
@@ -74,6 +74,7 @@ nothing until it is reset.
 | `scan` | raw BLE scan for Find My packets |
 | `pin` | set a new console PIN |
 | `unlock` / `lock` | leave the console unlocked / locked |
+| `wipe` | factory reset: erase keys + PIN, unpair, re-pair with `pair` |
 | `log` | show or follow `state/toolbox.log` |
 | `help` | command overview |
 
@@ -200,6 +201,29 @@ every recent slot key of every paired device.
 
 `pin` needs the device paired (otherwise the factory PIN keeps config mode
 alive); it prints and stores the new PIN.
+
+### wipe
+
+```bash
+./findmy-toolbox.py wipe                  # asks you to type 'wipe' first
+./findmy-toolbox.py wipe --yes            # non-interactive confirmation
+./findmy-toolbox.py wipe --id bike-tag --reset
+```
+
+Sends `WIPE`: the device drops its key chain, its console PIN and the
+brute-force failure counter, then **reboots into config mode** (factory PIN
+`00000000`, console always reachable, device never sleeps). Because the keys
+no longer exist anywhere, the matching entry is removed from
+`state/devices.json` — run [`pair`](#pair) afterwards to provision fresh
+ones.
+
+| Argument | Meaning |
+|---|---|
+| `--yes` / `-y` | skip the interactive confirmation (mandatory without a TTY) |
+| `--id NAME` | which device to wipe (default: the only one, or a prompt) |
+| `--pin PIN` | PIN used to unlock before wiping (default: stored) |
+| `--port PATH` | serial device (default: the stored port) |
+| `--reset` | pulse the reset line first |
 
 ### log
 

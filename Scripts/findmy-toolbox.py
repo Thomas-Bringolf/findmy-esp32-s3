@@ -491,7 +491,8 @@ class Beacon:
         if not self.wait_ready(ready_timeout):
             raise BeaconError(
                 f"device on {self.port} is not answering - asleep or not in "
-                f"its console? (press reset, or use 'test' to force one)")
+                f"its console? (pass --reset, press reset, or use 'test' to "
+                f"force one)")
         if self.auto_unlock:
             self.unlock()
 
@@ -2150,6 +2151,52 @@ def cmd_lock(args) -> int:
     return 0
 
 
+def cmd_wipe(args) -> int:
+    channel = "MAIN"
+    data = load_devices()
+    dev_id = pick_device(data, args.id)
+    device = find_device(data, dev_id)
+    port = resolve_port(args.port, device)
+    pin = unlock_pin_for(device, args.pin)
+
+    if not args.yes:
+        if not sys.stdin.isatty():
+            raise UserError("factory reset needs confirmation: pass --yes")
+        ui(f"this erases the key chain and the console PIN of '{dev_id}' "
+           f"on {port}", YELLOW + BOLD)
+        ui(f"the device reboots unpaired with the factory PIN {DEFAULT_PIN}, "
+           f"and '{dev_id}' is removed from {DEVICES_JSON.name}", DIM)
+        if prompt("type 'wipe' to continue").lower() != "wipe":
+            ui("cancelled - nothing was changed", DIM)
+            log(channel, "WIPE cancelled")
+            return 0
+
+    log(channel, f"factory-resetting '{dev_id}' on {port} (WIPE)")
+    beacon = Beacon(port, pin, dev_id=dev_id, channel=channel, auto_lock=False,
+                    pin_from_flag=args.pin is not None)
+    try:
+        beacon.after_open(reset=args.reset)
+        reply = beacon.cmd("WIPE", wait=5)
+        if not reply.startswith("OK WIPE"):
+            raise UserError(f"WIPE refused: {reply}")
+    finally:
+        beacon.close()
+
+    data = load_devices()
+    if find_device(data, dev_id) is not None:
+        data["devices"] = [d for d in data["devices"] if d["id"] != dev_id]
+        save_devices(data)
+        log(channel, f"'{dev_id}' dropped from {DEVICES_JSON.name}")
+
+    ui(f"\n'{dev_id}' was factory-reset on {port}", GREEN + BOLD)
+    ui("the keys and the PIN are gone from the device and from "
+       f"{DEVICES_JSON.name}", DIM)
+    ui(f"it is in config mode now: the console opens with the factory PIN "
+       f"{DEFAULT_PIN} and the device never sleeps", DIM)
+    ui("run 'pair' to provision fresh keys", DIM)
+    return 0
+
+
 def cmd_log(args) -> int:
     channel = "MAIN"
     if not LOG_FILE.exists():
@@ -2186,6 +2233,7 @@ findmy-toolbox.py - everything for the ESP32-S3 Find My beacon
   pin        set a new console PIN
   unlock     unlock the console (device left unlocked)
   lock       lock the console (device left locked)
+  wipe       factory reset: erase keys + PIN, unpair (--yes to confirm)
   log        show or follow state/toolbox.log
   help       show this overview
 
@@ -2216,6 +2264,7 @@ COMMANDS = {
     "pin": cmd_pin,
     "unlock": cmd_unlock,
     "lock": cmd_lock,
+    "wipe": cmd_wipe,
     "log": cmd_log,
     "help": cmd_help,
 }
@@ -2224,7 +2273,7 @@ COMMAND_CHANNEL = {
     "pair": "PAIR", "sync": "SYNC", "sync-ble": "SYNC-BLE", "devices": "MAIN",
     "test": "TEST", "power": "POWER", "retrieve": "RETRIEVE", "watch": "RETRIEVE",
     "monitor": "MONITOR", "verify": "VERIFY", "scan": "SCAN", "pin": "MAIN",
-    "unlock": "MAIN", "lock": "MAIN", "log": "MAIN", "help": "UI",
+    "unlock": "MAIN", "lock": "MAIN", "wipe": "MAIN", "log": "MAIN", "help": "UI",
 }
 
 MENU_ENTRIES = [
@@ -2242,6 +2291,7 @@ MENU_ENTRIES = [
     ("pin", "set a new console PIN"),
     ("unlock", "unlock the console (left unlocked)"),
     ("lock", "lock the console (left locked)"),
+    ("wipe", "factory reset: erase keys + PIN"),
     ("log", "show or follow toolbox.log"),
 ]
 
@@ -2439,23 +2489,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     for name, help_text in (("pin", "set a new console PIN"),
                             ("unlock", "unlock the console"),
-                            ("lock", "lock the console")):
+                            ("lock", "lock the console"),
+                            ("wipe", "factory reset: erase keys + PIN")):
         sub.add_parser(name, parents=[verbose], help=help_text) \
            .add_argument("--port")
     pin_parser = sub.choices["pin"]
     pin_parser.add_argument("--id")
     pin_parser.add_argument("--pin", help="current PIN (default: stored)")
     pin_parser.add_argument("--new-pin", help=f"{PIN_LEN} new digits")
-    for name in ("unlock", "lock"):
+    for name in ("unlock", "lock", "wipe"):
         sub.choices[name].add_argument("--id")
         sub.choices[name].add_argument("--pin")
+    sub.choices["wipe"].add_argument(
+        "--yes", "-y", action="store_true",
+        help="skip the interactive confirmation (required without a TTY)")
 
     log_parser = sub.add_parser("log", parents=[verbose],
                                 help="show or follow toolbox.log")
     log_parser.add_argument("--lines", type=int, default=50)
     log_parser.add_argument("--follow", action="store_true")
 
-    for name in ("pair", "sync", "power", "pin", "unlock", "lock"):
+    for name in ("pair", "sync", "power", "pin", "unlock", "lock", "wipe"):
         sub.choices[name].add_argument(
             "--reset", action="store_true",
             help="pulse the reset line first (device asleep / no console)")
