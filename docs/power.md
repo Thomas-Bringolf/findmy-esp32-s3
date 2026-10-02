@@ -137,5 +137,25 @@ definitive number, feed `--ma-awake` / `--ma-sleep` from a power profiler.
 | PWR log lines over UART (115200) | ~1 ms per cycle |
 | key rotation (every `rot_sec`) | **~2.15 s** (P-224 derivation + NVS commit), once per slot |
 
+## Low-battery mode
+
+`LOWBATT on [n]` makes the beacon alternate one normal active slot with `n`
+slots of **deep sleep** rather than light sleep. The `power` telemetry only
+sees the *active* slot (the deep-sleep gap has no `PWR` lines), so the duty
+it reports is per-active-slot, not the true long-term average. The real
+saving is the idle current: deep sleep (~10 µA) replaces light sleep
+(~0.7–1.5 mA) for `n/2` of the time, so the long-run average trends toward
+`(active_duty·I_awake) + (sleep_fraction·I_deep + active_fraction·~1mA)`.
+
+To observe the cycle, capture the raw console over the PWR lines: you see a
+run of `PWR sleep … awake_us=7 → sleep_us=1991 ms` light cycles, then a
+silence of `n·rot_sec` (deep sleep), then a wake that logs
+`resumed key chain at slot k` → `slot=k+n` (the batch catch-up, one P-224)
+followed by `NimBLE host synced` and the next run of light cycles.
+
+Measured on this build (`rot_sec=20`, `LOWBATT on 1`) the deep-sleep gap and
+wake catch-up are visible in that exact sequence; slot accounting stays
+aligned (advances by `1 + n` per active+sleep pair, one P-224 on wake).
+
 Ideas to push the duty cycle lower are tracked in
 [roadmap.md](roadmap.md).

@@ -17,6 +17,12 @@
 #define FM_DBG_SEC_MIN      60
 #define FM_DBG_SEC_MAX    3600
 
+/* Low-battery mode: how many slots are deep-slept after each active slot.
+ * Default 1 = skip every other slot; the max caps both the longest sleep
+ * and the longest batch catch-up on wake. Persisted in NVS. */
+#define FM_SKIP_SLOTS_DEFAULT 1
+#define FM_SKIP_SLOTS_MAX 48
+
 #ifndef FM_SLOT_SECONDS
 #define FM_SLOT_SECONDS 120
 #endif
@@ -55,6 +61,11 @@ int fm_current_pubkey(uint8_t x_out[28]);
 /* Advance the SK chain by one slot and persist it. 0 on success. */
 int fm_advance_slot(void);
 
+/* Advance the SK chain by `n` slots (via the one-way SHA-256 "update"
+ * KDF only - no P-224) and persist once. Skipped slots never derive a
+ * public key. 0 on success. */
+int fm_advance_slots(uint32_t n);
+
 /* Store new key material (pairing), reset the chain to slot 0, persist. */
 int fm_pair(const uint8_t master[FM_MASTER_LEN],
             const uint8_t skn[FM_SK_LEN]);
@@ -91,6 +102,14 @@ uint32_t fm_get_adv_ms(void);
 uint32_t fm_get_rot_sec(void);
 uint32_t fm_get_dbg_sec(void);
 int fm_set_config(uint32_t adv_ms, uint32_t rot_sec, uint32_t dbg_sec);
+
+/* Low-battery mode: after each active slot the beacon deep-sleeps
+ * `fm_skip_slots()` slots. `on` governs whether the mode is engaged (in
+ * time, a hardware pin will drive this); `slots` is clamped to 1..
+ * FM_SKIP_SLOTS_MAX (0 switches to 1). Persisted in NVS. */
+bool fm_low_battery_on(void);
+uint32_t fm_skip_slots(void);
+int fm_set_low_battery(bool on, uint32_t slots);
 
 /* Minimal base64 decoder. Returns decoded length or -1 on error. */
 int fm_base64_decode(const char *src, uint8_t *dst, size_t dst_size);

@@ -92,6 +92,9 @@ void app_update_status(void)
     if (config_mode()) {
         status |= FM_STATUS_CONFIG;
     }
+    if (fm_low_battery_on()) {
+        status |= FM_STATUS_LOWBATT;
+    }
     if (adv_data[6] == status) {
         return;
     }
@@ -131,9 +134,11 @@ static uint32_t cycles_per_slot(void)
 }
 
 /* Steady-state loop entered after the post-boot debug window: publish one
- * advertising event per adv_ms and light-sleep the rest of the cycle.
- * Returns only if the device turns out to be unpaired (the caller then
- * falls back to the pairing console instead of light-sleeping forever). */
+ * advertising event per adv_ms and light-sleep the rest of the cycle. In
+ * low-battery mode, one slot of this alternates with a deep sleep covering
+ * fm_skip_slots() more slots. Returns only if the device turns out to be
+ * unpaired (the caller then falls back to the pairing console instead of
+ * light-sleeping forever). */
 static void run_light_sleep_cycle(void)
 {
     (void)nvs_flash_init();
@@ -156,7 +161,17 @@ static void run_light_sleep_cycle(void)
 
     const uint64_t cycle_us = (uint64_t)fm_get_adv_ms() * 1000ULL;
 
-    if (rtc_state.magic == FM_RTC_MAGIC && rtc_state.paired) {
+    if (rtc_state.lowbat_skip) {
+        /* Woke from a low-battery deep sleep: jump the one-way SK chain
+         * forward by the skipped slots and derive only the current slot's
+         * public key. The skipped slots never derive a key. */
+        rtc_state.lowbat_skip = 0;
+        rtc_state.i = 0;
+        if (fm_advance_slots(fm_skip_slots()) != 0) {
+            ESP_LOGE(LOG_TAG, "low-battery catch-up failed");
+        }
+        ble_adv_apply_current_key();
+    } else if (rtc_state.magic == FM_RTC_MAGIC && rtc_state.paired) {
         ble_adv_restore_frame();
     } else {
         /* RTC memory lost (brown-out/battery swap): rebuild from NVS. */
@@ -171,12 +186,23 @@ static void run_light_sleep_cycle(void)
 
         ESP_LOGI(LOG_TAG, "PWR wake t=%lld", (long long)t_wake);
 
+        adv_data[6] = fm_low_battery_on() ? FM_STATUS_LOWBATT : 0x00;
         (void)ble_adv_publish_once();
 
         rtc_state.i++;
         if (rtc_state.i >= cycles_per_slot()) {
+            if (fm_low_battery_on() && fm_skip_slots() > 0) {
+                /* Active slot done: deep-sleep the skipped slots instead of
+                 * deriving their keys - they are batch-advanced on wake. */
+                rtc_state.i = 0;
+                rtc_state.lowbat_skip = 1;
+                ble_adv_shutdown();
+                enter_deep_sleep((uint64_t)fm_skip_slots() *
+                                 (uint64_t)fm_get_rot_sec() * 1000000ULL);
+                /* never returns */
+            }
             if (fm_key_init() == 0 && fm_advance_slot() == 0) {
-                adv_data[6] = 0x00;
+                adv_data[6] = fm_low_battery_on() ? FM_STATUS_LOWBATT : 0x00;
                 ble_adv_apply_current_key();
                 rtc_state.i = 0;
             }

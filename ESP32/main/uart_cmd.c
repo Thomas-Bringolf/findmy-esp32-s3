@@ -360,13 +360,16 @@ static void handle_stat(void)
 
 static void handle_status(void)
 {
-    reply("STATUS paired=%d slot=%u debug=%d adv_ms=%u rot_sec=%u dbg_sec=%u",
+    reply("STATUS paired=%d slot=%u debug=%d adv_ms=%u rot_sec=%u dbg_sec=%u "
+          "lomode=%d loslots=%u",
           fm_is_paired() ? 1 : 0,
           fm_is_paired() ? (unsigned)fm_current_slot() : 0u,
           fm_debug_enabled() ? 1 : 0,
           (unsigned)fm_get_adv_ms(),
           (unsigned)fm_get_rot_sec(),
-          (unsigned)fm_get_dbg_sec());
+          (unsigned)fm_get_dbg_sec(),
+          fm_low_battery_on() ? 1 : 0,
+          (unsigned)fm_skip_slots());
 }
 
 static void handle_config(char *adv_ms_s, char *rot_sec_s, char *dbg_sec_s)
@@ -391,6 +394,47 @@ static void handle_config(char *adv_ms_s, char *rot_sec_s, char *dbg_sec_s)
           (unsigned)fm_get_adv_ms(),
           (unsigned)fm_get_rot_sec(),
           (unsigned)fm_get_dbg_sec());
+}
+
+/* LOWBATT on|off [slots]: toggle low-battery mode. `on` without a count
+ * defaults to FM_SKIP_SLOTS_DEFAULT (1 = skip every other slot). The mode
+ * only affects steady state, so it takes effect at the end of the current
+ * slot. Mirrored on the advertising status byte (FM_STATUS_LOWBATT). */
+static void handle_lowbatt(char *state_s, char *slots_s)
+{
+    bool on;
+
+    if (state_s == NULL || strtok(NULL, " ") != NULL) {
+        reply("ERR ARGS");
+        return;
+    }
+    if (!fm_is_paired()) {
+        reply("ERR UNPAIRED");
+        return;
+    }
+    if (strcmp(state_s, "on") == 0 || strcmp(state_s, "1") == 0) {
+        on = true;
+    } else if (strcmp(state_s, "off") == 0 || strcmp(state_s, "0") == 0) {
+        on = false;
+    } else {
+        reply("ERR ARGS");
+        return;
+    }
+    uint32_t slots = on ? FM_SKIP_SLOTS_DEFAULT : 1;
+    if (slots_s != NULL && !parse_u32(slots_s, &slots)) {
+        reply("ERR ARGS");
+        return;
+    }
+    if (fm_set_low_battery(on, slots) != 0) {
+        reply("ERR NVS");
+        return;
+    }
+    app_update_status();
+    ESP_LOGI(TAG, "low-battery mode %s (%u slot(s) skipped per active slot)",
+             on ? "on" : "off",
+             (unsigned)(on ? fm_skip_slots() : 0u));
+    reply("OK LOWBATT %s loslots=%u", on ? "on" : "off",
+          on ? (unsigned)fm_skip_slots() : 0u);
 }
 
 /* Factory reset (WIPE, no arguments): drops the key chain, the console PIN
@@ -516,6 +560,10 @@ static void handle_line(char *line)
         char *b = strtok(NULL, " ");
         char *c = strtok(NULL, " ");
         handle_config(a, b, c);
+    } else if (strcmp(cmd, "LOWBATT") == 0) {
+        char *a = strtok(NULL, " ");
+        char *b = strtok(NULL, " ");
+        handle_lowbatt(a, b);
     } else {
         reply("ERR CMD");
     }

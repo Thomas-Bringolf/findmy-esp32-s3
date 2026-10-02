@@ -175,6 +175,8 @@ cd Scripts
 | `reset` | reboot a beacon over the control lines (wake it up) |
 | `apple-id` | save / forget the Apple ID session (`status`/`connect`/`disconnect`) |
 | `sync` / `sync-ble` | align the slot counter (USB / advertisement only) |
+| `status` | print the device's config settings from `STATUS?` |
+| `lowbatt` | toggle low-battery mode (`on [n]` / `off`) |
 | `devices` | list paired beacons |
 | `test` | hardware-in-the-loop protocol suite (resets the device) |
 | `power` | awake/sleep duty cycle from the `PWR` telemetry |

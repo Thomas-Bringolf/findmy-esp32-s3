@@ -23,11 +23,16 @@
 /* Status byte (adv_data[6]) bitfield, readable by any BLE scanner. */
 #define FM_STATUS_UNLOCKED (1u << 0)   /* 1 = UART console unlocked */
 #define FM_STATUS_CONFIG   (1u << 1)   /* 1 = config mode (never sleeps) */
+#define FM_STATUS_LOWBATT  (1u << 2)   /* 1 = low-battery mode (skips slots) */
+
+/* Low-battery skip-slot bounds live in findmy_keys.h, next to the rest of
+ * the runtime config limits (FM_SKIP_SLOTS_MAX, FM_SKIP_SLOTS_DEFAULT). */
 
 typedef struct {
     uint32_t magic;
     uint8_t  sleep_bit;
     uint8_t  paired;
+    uint8_t  lowbat_skip;   /* 1 = wake must batch-advance the slot chain */
     uint32_t i;
     uint8_t  adv[ADV_DATA_LEN];
     uint8_t  addr[6];

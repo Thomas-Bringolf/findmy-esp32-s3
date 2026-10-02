@@ -110,7 +110,7 @@ CHANNEL_COLOR = {
     "MAIN": WHITE, "UI": CYAN, "PAIR": GREEN, "SYNC": BLUE,
     "SYNC-BLE": BLUE, "KEYGEN": YELLOW, "RETRIEVE": MAGENTA, "TEST": WHITE,
     "POWER": YELLOW, "VERIFY": GREEN, "SCAN": BLUE, "MONITOR": CYAN,
-    "WORKER": MAGENTA, "ERROR": RED,
+    "LOWBATT": YELLOW, "WORKER": MAGENTA, "ERROR": RED,
 }
 
 LOG_COLOR = sys.stderr.isatty() and "NO_COLOR" not in os.environ
@@ -421,7 +421,8 @@ def save_entry(entry: dict) -> None:
 
 def fresh_device_entry(dev_id: str, port: str, master: bytes, skn: bytes,
                        paired_at: datetime, pin: str, adv_ms: int,
-                       rot_sec: int, dbg_sec: int) -> dict:
+                       rot_sec: int, dbg_sec: int, *,
+                       lomode: int = 0, loslots: int = 0) -> dict:
     b64 = lambda x: base64.b64encode(x).decode()
     return {
         "id": dev_id,
@@ -435,6 +436,8 @@ def fresh_device_entry(dev_id: str, port: str, master: bytes, skn: bytes,
         "adv_ms": adv_ms,
         "rot_sec": rot_sec,
         "dbg_sec": dbg_sec,
+        "lomode": lomode,
+        "loslots": loslots,
         "pin": pin,
     }
 
@@ -640,6 +643,8 @@ def status_decode(status_byte: int) -> str:
     bits = []
     bits.append("UNLOCKED" if status_byte & 0x01 else "locked")
     bits.append("CONFIG" if status_byte & 0x02 else "sleep-cycle")
+    if status_byte & 0x04:
+        bits.append("lowbatt")
     return f"0x{status_byte:02x} ({'+'.join(bits)})"
 
 
@@ -932,14 +937,16 @@ def cmd_devices(args) -> int:
         ui(f"no devices in {DEVICES_JSON}")
         return 0
     header = (f"{'id':<20} {'port':<14} {'slot':>5} {'adv':>6} {'rot':>6} "
-              f"{'dbg':>5}  {'paired':<20} pin")
+              f"{'dbg':>5} {'lb':>4}  {'paired':<20} pin")
     ui(header, MAGENTA + BOLD)
     for d in devices:
+        lb = ("-" if not d.get("lomode")
+              else f"{d.get('loslots', 1)}")
         ui(f"{d['id']:<20} {d.get('port', '?'):<14} "
            f"{str(d.get('last_known_slot', '?')):>5} "
            f"{str(d.get('adv_ms', '?')):>6} {str(d.get('rot_sec', '?')):>6} "
-           f"{str(d.get('dbg_sec', '?')):>5}  {d.get('paired_at', '?'):<20} "
-           f"{device_pin(d)}")
+           f"{str(d.get('dbg_sec', '?')):>5} {lb:>4}  "
+           f"{d.get('paired_at', '?'):<20} {device_pin(d)}")
     log("MAIN", f"{len(devices)} device(s) in {DEVICES_JSON.name}")
     return 0
 
@@ -983,6 +990,11 @@ def cmd_pair(args) -> int:
     else:
         dbg_sec = (prompt_int("console countdown in s", 600, 60, 3600, (0,))
                    if ask else 600)
+    if args.lomode is not None:
+        lomode = args.lomode
+    else:
+        lomode = (prompt_int("low-battery: slots to skip per active slot "
+                             "(0 = off)", 0, 0, 48) if ask else 0)
 
     # From a connection the console stays open (the menu keeps working on
     # it); a plain CLI run locks the device again when it is done.
@@ -1033,8 +1045,20 @@ def cmd_pair(args) -> int:
             raise UserError(f"PIN change refused: {reply}")
         beacon.pin = new_pin
 
+        loslots = 0
+        if lomode and lomode > 0:
+            reply = beacon.cmd(f"LOWBATT on {lomode}")
+            if not reply.startswith("OK LOWBATT"):
+                raise UserError(f"low-battery mode refused: {reply}")
+            m = re.search(r"loslots=(\d+)", reply)
+            loslots = int(m.group(1)) if m else lomode
+        else:
+            beacon.cmd("LOWBATT off")
+
         save_entry(fresh_device_entry(dev_id, port, master, skn, paired_at,
-                                      new_pin, adv_ms, rot_sec, dbg_sec))
+                                      new_pin, adv_ms, rot_sec, dbg_sec,
+                                      lomode=1 if lomode and lomode > 0 else 0,
+                                      loslots=loslots))
         if CONNECTED is not None and CONNECTED.get("port") == port:
             CONNECTED.update({"id": dev_id, "name": dev_id, "paired": True,
                               "pin": new_pin})
@@ -1046,6 +1070,8 @@ def cmd_pair(args) -> int:
     ui(f"  slot 0 X : {got}")
     ui(f"  timings  : adv_ms={adv_ms} rot_sec={rot_sec} dbg_sec={dbg_sec}")
     ui(f"  PIN      : {paint(GREEN, new_pin, ui=True)}")
+    if loslots:
+        ui(f"  lowbatt  : on ({loslots} slot(s) skipped per active slot)")
     ui(f"  stored   : {DEVICES_JSON}")
     return 0
 
@@ -1091,7 +1117,87 @@ def cmd_sync(args) -> int:
     return 0
 
 
+def cmd_lowbatt(args) -> int:
+    channel = "LOWBATT"
+    data = load_devices()
+    dev_id = pick_device(data, args.id)
+    device = find_device(data, dev_id)
+    port = resolve_port(args.port, device)
+    pin = unlock_pin_for(device, args.pin)
+
+    on = args.state.lower() in ("on", "1", "y", "yes")
+    cmd = "LOWBATT on" if on else "LOWBATT off"
+    if on and args.slots:
+        cmd += f" {int(args.slots)}"
+
+    log(channel, f"'{dev_id}': {cmd}")
+    beacon = Beacon(port, pin, dev_id=dev_id, channel=channel,
+                    pin_from_flag=args.pin is not None)
+    try:
+        beacon.after_open(reset=args.reset)
+        reply = beacon.cmd(cmd)
+        if not reply.startswith("OK LOWBATT"):
+            raise UserError(reply)
+        loslots = 0
+        m = re.search(r"loslots=(\d+)", reply)
+        if m:
+            loslots = int(m.group(1))
+        device["lomode"] = 1 if on else 0
+        device["loslots"] = loslots if on else 0
+        save_devices(data)
+    finally:
+        beacon.close()
+
+    ui(f"low-battery mode {'on' if on else 'off'} "
+       f"({loslots} slot(s) skipped per active slot)")
+    return 0
+
+
+def cmd_status(args) -> int:
+    """Print every config setting the firmware reports via STATUS?."""
+    channel = "STATUS"
+    data = load_devices()
+    dev_id = pick_device(data, args.id)
+    device = find_device(data, dev_id)
+    port = resolve_port(args.port, device)
+    pin = unlock_pin_for(device, args.pin)
+
+    log(channel, f"'{dev_id}': asking for STATUS? on {port}")
+    beacon = Beacon(port, pin, dev_id=dev_id, channel=channel,
+                    pin_from_flag=args.pin is not None)
+    try:
+        beacon.after_open(reset=args.reset)
+        reply = beacon.cmd("STATUS?")
+        if not reply.startswith("STATUS "):
+            raise UserError(reply)
+    finally:
+        beacon.close()
+
+    kv: dict[str, str] = {}
+    for token in reply.split()[1:]:
+        if "=" in token:
+            key, _, val = token.partition("=")
+            kv[key] = val
+
+    ui(f"\n{'setting':<34} value", DIM)
+    ui(f"  {'paired':<32} {'yes' if kv.get('paired') == '1' else 'no'}")
+    ui(f"  {'slot index':<32} {kv.get('slot', '?')}")
+    ui(f"  {'debug logging':<32} {'on' if kv.get('debug') == '1' else 'off'}")
+    ui(f"  {'advertisement period (adv_ms)':<32} {kv.get('adv_ms', '?')} ms")
+    ui(f"  {'key rotation period (rot_sec)':<32} {kv.get('rot_sec', '?')} s")
+    ui(f"  {'console countdown (dbg_sec)':<32} {kv.get('dbg_sec', '?')} s")
+    lb_on = kv.get("lomode") == "1"
+    lb_value = "off"
+    if lb_on:
+        lb_value = (f"on, {kv.get('loslots', '?')} slot(s) skipped "
+                    "per active slot")
+    ui(f"  {'low-battery mode':<32} {lb_value}")
+    ui("")
+    return 0
+
+
 async def ble_scan(window: float) -> dict[str, dict]:
+    from bleak import BleakScanner
     from bleak import BleakScanner
 
     seen: dict[str, dict] = {}
@@ -1413,6 +1519,29 @@ def cmd_test(args) -> int:
                     reply.startswith("OK CONFIG adv_ms=2000 rot_sec=120 dbg_sec=600"),
                     reply)
 
+        suite.step("P1b: low-battery mode")
+        reply = beacon.cmd("LOWBATT")
+        suite.check("LOWBATT no args -> ERR ARGS",
+                    reply.startswith("ERR ARGS"), reply)
+        reply = beacon.cmd("LOWBATT maybe 1")
+        suite.check("LOWBATT bad state -> ERR ARGS",
+                    reply.startswith("ERR ARGS"), reply)
+        reply = beacon.cmd("LOWBATT on x")
+        suite.check("LOWBATT bad slots -> ERR ARGS",
+                    reply.startswith("ERR ARGS"), reply)
+        reply = beacon.cmd("LOWBATT on 999999")
+        suite.check("LOWBATT slots clamp to max", "loslots=48" in reply, reply)
+        reply = beacon.cmd("LOWBATT off")
+        suite.check("LOWBATT off", reply.startswith("OK LOWBATT off"), reply)
+        reply = beacon.cmd("LOWBATT on")
+        suite.check("LOWBATT on defaults to 1", "loslots=1" in reply, reply)
+        status = beacon.cmd("STATUS?")
+        suite.check("STATUS? reflects lomode",
+                    "lomode=1 loslots=1" in status, status)
+        reply = beacon.cmd("LOWBATT off")
+        suite.check("LOWBATT back off",
+                    reply.startswith("OK LOWBATT off"), reply)
+
         suite.step("P2: PIN rotation and lock round-trip")
         reply = beacon.cmd("PIN 12ab3456")
         suite.check("PIN with letters -> ERR ARGS", reply.startswith("ERR ARGS"),
@@ -1543,6 +1672,12 @@ def cmd_test(args) -> int:
             raise
         reply = beacon.cmd("STATUS?")
         suite.check("countdown setting survived", "dbg_sec=60" in reply, reply)
+        reply = beacon.cmd("LOWBATT on 2")
+        suite.check("LOWBATT on 2 persisted past the reset",
+                    "loslots=2" in reply, reply)
+        reply = beacon.cmd("LOWBATT off")
+        suite.check("LOWBATT cleared again",
+                    reply.startswith("OK LOWBATT off"), reply)
         reply = beacon.cmd("CONFIG 2000 120 600")
         suite.check("defaults restored",
                     reply.startswith("OK CONFIG adv_ms=2000 rot_sec=120 dbg_sec=600"),
@@ -3430,6 +3565,8 @@ COMMANDS = {
     "apple-id": cmd_apple,
     "sync": cmd_sync,
     "sync-ble": cmd_sync_ble,
+    "lowbatt": cmd_lowbatt,
+    "status": cmd_status,
     "devices": cmd_devices,
     "test": cmd_test,
     "power": cmd_power,
@@ -3450,6 +3587,7 @@ COMMAND_CHANNEL = {
     "pair": "PAIR", "connect": "CONNECT", "disconnect": "MAIN",
     "reset": "MAIN", "apple-id": "APPLE", "sync": "SYNC", "sync-ble": "SYNC-BLE",
     "devices": "MAIN", "test": "TEST", "power": "POWER", "retrieve": "RETRIEVE",
+    "lowbatt": "LOWBATT", "status": "MAIN",
     "watch": "RETRIEVE", "monitor": "MONITOR", "verify": "VERIFY", "scan": "SCAN",
     "pin": "MAIN", "unlock": "MAIN", "lock": "MAIN", "wipe": "MAIN",
     "log": "MAIN", "help": "UI",
@@ -3482,6 +3620,7 @@ MENU_GROUPS = [
          ["disconnect"], "console"),
         ("reset", "reboot a beacon (wake it up)", ["reset"], None),
         ("sync", "sync the slot counter (USB)", ["sync"], "console"),
+        ("status", "show the device's config settings", ["status"], "console"),
         ("unlock", "unlock the console", ["unlock"], "console"),
         ("lock", "lock the console", ["lock"], "console"),
     ]),
@@ -3489,6 +3628,7 @@ MENU_GROUPS = [
         ("pair", "re-pair the connected beacon (new keys)",
          ["pair", "--force"], "console"),
         ("pin", "set a new console PIN", ["pin"], "console"),
+        ("lowbatt", "toggle low-battery mode", ["lowbatt"], "console"),
         ("wipe", "factory reset: erase keys + PIN", ["wipe"], "console"),
     ]),
     ("debug", MAGENTA, [
@@ -3739,7 +3879,10 @@ def build_parser() -> argparse.ArgumentParser:
     pair.add_argument("--rot-sec", type=int, help="key rotation period (s, "
                                                   "prompted when omitted)")
     pair.add_argument("--dbg-sec", type=int, help="console countdown (s, "
-                                                  "prompted when omitted)")
+                                                   "prompted when omitted)")
+    pair.add_argument("--lomode", type=int, metavar="N",
+                      help="low-battery mode: skip N slots per active slot "
+                           "(0/omitted = off, max 48)")
 
     connect = sub.add_parser("connect", parents=[verbose],
                              help="identify + unlock a beacon over UART")
@@ -3783,6 +3926,26 @@ def build_parser() -> argparse.ArgumentParser:
     sync_ble.add_argument("--window", type=float, default=DEFAULT_SCAN_SECS,
                           help="scan window in seconds")
     sync_ble.add_argument("--max-slots", type=int, default=None, metavar="N")
+
+    lowbatt = sub.add_parser(
+        "lowbatt", parents=[verbose],
+        help="toggle low-battery mode (skip slots per active slot)")
+    lowbatt.add_argument("state", nargs="?", default="on",
+                         choices=("on", "off", "1", "0"),
+                         help="on/off (default on)")
+    lowbatt.add_argument("slots", nargs="?", type=int, default=0,
+                         help="slots to skip per active slot (1..48, "
+                              "default 1); ignored for 'off'")
+    lowbatt.add_argument("--port")
+    lowbatt.add_argument("--id")
+    lowbatt.add_argument("--pin")
+
+    status = sub.add_parser(
+        "status", parents=[verbose],
+        help="print the device's config settings (STATUS?)")
+    status.add_argument("--port")
+    status.add_argument("--id")
+    status.add_argument("--pin")
 
     sub.add_parser("devices", parents=[verbose], help="list paired devices")
 
@@ -3886,7 +4049,7 @@ def build_parser() -> argparse.ArgumentParser:
     log_parser.add_argument("--follow", action="store_true")
 
     for name in ("pair", "sync", "power", "pin", "unlock", "lock", "wipe",
-                 "disconnect"):
+                 "disconnect", "lowbatt", "status"):
         sub.choices[name].add_argument(
             "--reset", action="store_true",
             help="pulse the reset line first (device asleep / no console)")

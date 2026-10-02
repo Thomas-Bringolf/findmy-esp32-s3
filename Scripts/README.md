@@ -68,6 +68,8 @@ nothing until it is reset.
 | `apple-id` | `status` / `connect [apple-id]` / `disconnect` the saved session |
 | `sync` | read the current slot over USB (`SLOT?`/`KEY?`) |
 | `sync-ble` | same, from the BLE advertisement alone (no USB) |
+| `status` | print all device config settings returned by `STATUS?` |
+| `lowbatt` | toggle the beacon's low-battery mode (`on [n]` / `off`) |
 | `devices` | list paired devices |
 | `test` | console protocol edge cases (resets the device) |
 | `power` | awake/sleep duty cycle from the `PWR` telemetry |
@@ -186,6 +188,37 @@ keys in `devices.json`.
 The reported "estimated pair time" (now − slot × slot_seconds) can be later
 than the stored pairing time — the difference is time the device spent
 powered off, it does not affect sync correctness.
+
+### status
+
+```bash
+./findmy-toolbox.py status --id Thinkpad   # print STATUS?
+./findmy-toolbox.py status --reset         # wake a deep-sleeping beacon first
+```
+
+Connects, unlocks and runs `STATUS?`, then prints every setting the firmware
+returns: `paired`, `slot`, `debug`, `adv_ms`, `rot_sec`, `dbg_sec` and the
+low-battery mode (`lomode` + `loslots`). A `--reset` pulses the reset line
+first, which is needed when the beacon is deep in a low-battery sleep.
+
+### lowbatt
+
+```bash
+./findmy-toolbox.py lowbatt on          # default: skip 1 slot per active slot
+./findmy-toolbox.py lowbatt on 3        # skip 3 slots per active slot
+./findmy-toolbox.py lowbatt off         # disable
+./findmy-toolbox.py pair --lomode 1     # enable during pairing (prompted on a TTY)
+```
+
+Low-battery mode (`LOWBATT on|off [n]` on the device, `n` clamped to
+1–48). The beacon runs one normal active slot of the light-sleep loop above,
+then **deep sleeps `n` more slot-lengths**, batch-advancing the one-way SK
+chain on wake and deriving the current slot's P-224 key exactly once. This
+drops the idle current to deep-sleep levels (~10 µA) for `n` of every
+`n+1` slots, at the cost of the beacon being off-air during the gap. The
+advertising status byte reports it (`FM_STATUS_LOWBATT`), the deep-sleep gap
+shows as a silence in the `PWR` log between two runs of light cycles, and
+`devices` lists the current skip count in the `lb` column.
 
 ### test
 
@@ -413,8 +446,8 @@ Every entry is always listed, grouped by type and coloured by group:
 |---|---|---|
 | `MONITORING` | cyan | `devices`, `retrieve`, `doctor`, `watch`, `restart`, `monitor`, `log` |
 | `RADIO (BLE)` | blue | `verify`, `scan`, `sync-ble` |
-| `CONSOLE (UART)` | green | `connect`, `disconnect`, `reset`, `sync`, `unlock`, `lock` |
-| `PROVISIONING` | yellow | `pair`, `pin`, `wipe` |
+| `CONSOLE (UART)` | green | `connect`, `disconnect`, `reset`, `sync`, `status`, `unlock`, `lock` |
+| `PROVISIONING` | yellow | `pair`, `pin`, `lowbatt`, `wipe` |
 | `DEBUG` | magenta | `test`, `power` |
 | `APPLE ID` | white | `apple connect`, `apple status`, `apple disconnect` |
 | `SYSTEM` | white | `help` |

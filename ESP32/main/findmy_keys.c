@@ -365,6 +365,10 @@ static uint32_t fm_adv_ms = FM_ADV_MS_DEFAULT;
 static uint32_t fm_rot_sec = FM_SLOT_SECONDS;
 static uint32_t fm_dbg_sec = FM_DBG_SEC_DEFAULT;
 
+/* Low-battery mode: engaged flag + slots to deep-sleep per active slot. */
+static bool fm_lowbatt = false;
+static uint32_t fm_loslots = FM_SKIP_SLOTS_DEFAULT;
+
 /* Console PIN + wrong-UNLOCK counter (see findmy_keys.h). */
 static char fm_pin[FM_PIN_LEN + 1] = FM_PIN_DEFAULT;
 static uint32_t fm_pin_fail_count = 0;
@@ -390,6 +394,13 @@ static uint32_t clamp_dbg_sec(uint32_t v)
 {
     if (v == 0) return 0;
     if (v < FM_DBG_SEC_MIN || v > FM_DBG_SEC_MAX) return FM_DBG_SEC_DEFAULT;
+    return v;
+}
+
+static uint32_t clamp_loslots(uint32_t v)
+{
+    if (v == 0) return FM_SKIP_SLOTS_DEFAULT;
+    if (v > FM_SKIP_SLOTS_MAX) return FM_SKIP_SLOTS_MAX;
     return v;
 }
 
@@ -545,6 +556,8 @@ static int nvs_write_all(void)
     nvs_set_u32(h, "advms", fm_adv_ms);
     nvs_set_u32(h, "rotsec", fm_rot_sec);
     nvs_set_u32(h, "dbgsec", fm_dbg_sec);
+    nvs_set_u32(h, "loslots", fm_loslots);
+    nvs_set_u8(h, "lomode", fm_lowbatt ? 1 : 0);
     nvs_commit(h);
     nvs_close(h);
     return 0;
@@ -622,6 +635,16 @@ int fm_key_init(void)
     if (nvs_get_u32(h, "dbgsec", &dbg_sec) == ESP_OK) {
         fm_dbg_sec = clamp_dbg_sec(dbg_sec);
     }
+    uint32_t loslots = 0;
+    uint8_t lomode = 0;
+    if (nvs_get_u32(h, "loslots", &loslots) == ESP_OK) {
+        fm_loslots = clamp_loslots(loslots);
+    }
+    if (nvs_get_u8(h, "lomode", &lomode) == ESP_OK) {
+        fm_lowbatt = (lomode != 0);
+    } else {
+        fm_lowbatt = false;
+    }
     /* Console PIN + failure counter: absent before the first PIN command
      * or after a wipe, in which case the factory defaults stay. */
     if (xSemaphoreTake(fm_lock, portMAX_DELAY) == pdTRUE) {
@@ -683,7 +706,12 @@ int fm_current_pubkey(uint8_t x_out[28])
     return rc;
 }
 
-int fm_advance_slot(void)
+/* Advance the SK chain by `n` slots without ever deriving a public key for
+ * the skipped slots, then persist once. The X963/SHA-256 "update" KDF is
+ * the whole cost (a few SHA-256 hashes per slot); the P-224 public key
+ * derivation is deliberately left to one fm_current_pubkey() call on the
+ * slot the caller actually advertises. */
+int fm_advance_slots(uint32_t n)
 {
     uint8_t next[FM_SK_LEN];
 
@@ -694,13 +722,15 @@ int fm_advance_slot(void)
         xSemaphoreGive(fm_lock);
         return -1;
     }
-    if (x963_kdf_sha256(fm_sk, FM_SK_LEN, (const uint8_t *)"update", 6,
-                        next, FM_SK_LEN) != 0) {
-        xSemaphoreGive(fm_lock);
-        return -1;
+    for (uint32_t k = 0; k < n; k++) {
+        if (x963_kdf_sha256(fm_sk, FM_SK_LEN, (const uint8_t *)"update", 6,
+                            next, FM_SK_LEN) != 0) {
+            xSemaphoreGive(fm_lock);
+            return -1;
+        }
+        memcpy(fm_sk, next, FM_SK_LEN);
+        fm_slot++;
     }
-    memcpy(fm_sk, next, FM_SK_LEN);
-    fm_slot++;
     pk_cache_valid = false;
     if (nvs_write_all() != 0) {
         ESP_LOGE(TAG, "failed to persist key chain state");
@@ -709,6 +739,33 @@ int fm_advance_slot(void)
     }
     xSemaphoreGive(fm_lock);
     return 0;
+}
+
+int fm_advance_slot(void)
+{
+    return fm_advance_slots(1);
+}
+
+bool fm_low_battery_on(void)
+{
+    return fm_lowbatt;
+}
+
+uint32_t fm_skip_slots(void)
+{
+    return fm_lowbatt ? fm_loslots : 0;
+}
+
+int fm_set_low_battery(bool on, uint32_t slots)
+{
+    if (xSemaphoreTake(fm_lock, portMAX_DELAY) != pdTRUE) {
+        return -1;
+    }
+    fm_lowbatt = on;
+    fm_loslots = clamp_loslots(slots);
+    int rc = nvs_write_all();
+    xSemaphoreGive(fm_lock);
+    return rc;
 }
 
 int fm_pair(const uint8_t master[FM_MASTER_LEN],
@@ -760,6 +817,8 @@ int fm_unpair(void)
     fm_adv_ms = FM_ADV_MS_DEFAULT;
     fm_rot_sec = FM_SLOT_SECONDS;
     fm_dbg_sec = FM_DBG_SEC_DEFAULT;
+    fm_lowbatt = false;
+    fm_loslots = FM_SKIP_SLOTS_DEFAULT;
     xSemaphoreGive(fm_lock);
     return 0;
 }

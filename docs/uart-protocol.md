@@ -222,10 +222,29 @@ Side effects: persisted to NVS, and advertising + the rotation timer are
 restarted. **A `dbg_sec` change only affects the session that starts next**
 (current window length is already fixed at session start).
 
+### LOWBATT
+```
+LOWBATT on [slots]
+LOWBATT off        -> OK LOWBATT on loslots=.. | OK LOWBATT off | ERR ARGS |
+                       ERR UNPAIRED | ERR NVS
+```
+Toggles low-battery mode. `on` without a count defaults to 1 (skip every
+other slot); an explicit count is clamped to `1 … FM_SKIP_SLOTS_MAX` (48).
+`off` disables it. Needs key material (`ERR UNPAIRED` otherwise).
+
+In low-battery mode the beacon runs one normal active slot (light-sleep
+advertising every `adv_ms`, one key rotation per `rot_sec`), then **deep
+sleeps `slots` more slot-lengths** instead of deriving them. On wake it
+batch-advances the one-way SK chain by the skipped slots (SHA-256 only, no
+P-224) and derives the current slot's P-224 public key exactly once, so
+skipped slots never cost a key derivation. The status byte reflects the
+mode (`FM_STATUS_LOWBATT`). Takes effect at the end of the current slot.
+
 ### STAT? / STATUS?
 ```
 STAT?    -> STAT paired=<0|1> slot=<n> debug=<0|1>
 STATUS?  -> STATUS paired=.. slot=.. debug=.. adv_ms=.. rot_sec=.. dbg_sec=..
+                 lomode=<0|1> loslots=..
 ```
 Both are answered even when unpaired (`slot=0`).
 
@@ -254,6 +273,7 @@ rebuild payload → start; a no-op when advertising is not running):
 |---|---|---|
 | 0 | `FM_STATUS_UNLOCKED` | console unlocked |
 | 1 | `FM_STATUS_CONFIG` | config mode (unpaired **or** factory PIN) |
+| 2 | `FM_STATUS_LOWBATT` | low-battery mode (skipping slots) |
 
 The byte itself is still written at `adv_data[6]`.
 
