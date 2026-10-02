@@ -147,6 +147,7 @@ cd Scripts
 | 🧰 | [Scripts/README.md](Scripts/README.md) | the toolbox: all 16 subcommands, flags, menu |
 | ✅ | [CHECKS.txt](CHECKS.txt) | the full verification checklist (UART, BLE, timings, retrieval) |
 | 🧪 | [state_example/](state_example/) | what the (git-ignored) state folder looks like |
+| 📄 | [docs/papers/](docs/papers/) | the paper this protocol is based on (PDF, open access) |
 
 ---
 
@@ -251,12 +252,61 @@ fixed — is in **[CHECKS.txt](CHECKS.txt)**.
 
 ---
 
+## 📚 References & further reading
+
+### 📄 Papers
+
+| Paper | Where |
+|---|---|
+| **Who Can Find My Devices? Security and Privacy of Apple's Crowd-Sourced Bluetooth Location Tracking System** — Heinrich, Stute, Kornhuber, Hollick (PoPETs 2021(3):227–245). *The* reverse-engineering paper behind the Offline Finding protocol used here. | PDF in this repo: [`docs/papers/popets-2021-0045.pdf`](docs/papers/popets-2021-0045.pdf) · [DOI 10.2478/popets-2021-0045](https://doi.org/10.2478/popets-2021-0045) · [PoPETs page](https://petsymposium.org/popets/2021/popets-2021-0045.php) |
+| **DEMO: OpenHaystack: A Framework for Tracking Personal Bluetooth Devices via Apple's Massive Find My Network** — Heinrich, Stute, Hollick (WiSec '21) | [DOI 10.1145/3448300.3468251](https://doi.org/10.1145/3448300.3468251) |
+
+### 🛠️ Software this project builds on
+
+| Project | What we use it for |
+|---|---|
+| [**seemoo-lab/openhaystack**](https://github.com/seemoo-lab/openhaystack) | upstream framework + the ESP32 firmware this repo is derived from (AGPL-3.0) |
+| [**malmeloo/FindMy.py**](https://github.com/malmeloo/FindMy.py) · [PyPI `FindMy`](https://pypi.org/project/FindMy) · [docs](https://docs.mikealmel.ooo/FindMy.py/) | the `findmy` Python package: Apple account login, report fetching/decryption, key derivation cross-checks (MIT) |
+| [**ESP-IDF**](https://docs.espressif.com/projects/esp-idf/) | build system, NimBLE BLE stack, drivers (Espressif, LGPL) |
+| [**anisette**](https://pypi.org/project/anisette/) | local anisette server for the Apple login (pulled in by `FindMy.py`) |
+
+### 🍎 Apple documentation
+
+| Resource | Notes |
+|---|---|
+| [Find My network — Apple Developer](https://developer.apple.com/find-my) | official overview of the Find My network and the MFi accessory programme (the real specs live behind MFi) |
+| [Find My security — Apple Platform Security](https://support.apple.com/guide/security/find-my-security-sec6cbc80fd0/web) | Apple's own description of the P-224 key pair and the ~15 min key rotation this firmware reproduces |
+| [Locating missing devices](https://support.apple.com/guide/security/locating-missing-devices-sece994d0126/web) | how finder devices encrypt and relay location reports (ECIES, SHA-256 index) |
+| [Find My — Apple Support](https://support.apple.com/find-my) | user-facing help pages for the Find My app |
+| [Accessory Design Guidelines for Apple Devices](https://developer.apple.com/accessories/Accessory-Design-Guidelines.pdf) | BLE accessory requirements (MFi) |
+
+> ⚠️ Apple does **not** publish the Offline Finding protocol itself — the
+> technical specification is only available inside the MFi programme. The
+> wire format implemented in [`ESP32/main/`](ESP32/main) was recovered by the
+> PoPETs paper above (and by the OpenHaystack authors), which is exactly why
+> this project can exist at all.
+
+---
+
+## 📜 License
+
+| Part of this repo | License |
+|---|---|
+| `ESP32/` firmware | **[AGPL-3.0](LICENSE)** — derived from OpenHaystack, which is AGPL-3.0; this is the most permissive licence available for it, as copyleft must be preserved |
+| `Scripts/findmy-toolbox.py`, `docs/`, `state_example/`, `CHECKS.txt`, this README | **[MIT](LICENSE-MIT)** — original work for this repo, released as permissively as possible |
+| `Scripts/old/` | archived upstream snippets, retained under their original upstream licences; unmaintained |
+| [`docs/papers/popets-2021-0045.pdf`](docs/papers/popets-2021-0045.pdf) | **CC BY-NC-ND 3.0**, © the authors of the paper — redistributed unmodified with attribution, non-commercial, no derivatives; *not* covered by the licences above |
+
+---
+
 ## 🙏 Credits
 
 * Firmware derived from **[OpenHaystack](https://github.com/seemoo-lab/openhaystack)**
-  (Secure Mobile Networking Lab, TU Darmstadt) — AGPL-3.0.
-* Protocol implementation follows the Find&nbsp;My reverse-engineering work by
-  the OpenHaystack authors and the `findmy` Python library.
+  (Secure Mobile Networking Lab, TU Darmstadt) — AGPL-3.0, see [LICENSE](LICENSE).
+* Protocol reverse-engineering by **Heinrich, Stute, Kornhuber & Hollick** —
+  [Who Can Find My Devices?](https://doi.org/10.2478/popets-2021-0045), PoPETs 2021.
+* Report fetching, Apple login and key derivation cross-checks by
+  **Mike Almeloo's [FindMy.py](https://github.com/malmeloo/FindMy.py)** (MIT).
 * Everything else in this repository was written by AI without human review —
   you have been warned at the top of this page. 🙂
 
