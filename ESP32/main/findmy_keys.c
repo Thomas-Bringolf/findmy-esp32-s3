@@ -369,6 +369,9 @@ static uint32_t fm_dbg_sec = FM_DBG_SEC_DEFAULT;
 static char fm_pin[FM_PIN_LEN + 1] = FM_PIN_DEFAULT;
 static uint32_t fm_pin_fail_count = 0;
 
+/* Device name (see findmy_keys.h): "" until the first NAME command. */
+static char fm_name[FM_NAME_LEN + 1] = "";
+
 static uint32_t clamp_adv_ms(uint32_t v)
 {
     if (v < FM_ADV_MS_MIN) return FM_ADV_MS_MIN;
@@ -629,6 +632,10 @@ int fm_key_init(void)
         if (nvs_get_u32(h, "pinfails", &fm_pin_fail_count) != ESP_OK) {
             fm_pin_fail_count = 0;
         }
+        len = sizeof(fm_name);
+        if (nvs_get_str(h, "name", fm_name, &len) != ESP_OK) {
+            fm_name[0] = '\0';
+        }
         xSemaphoreGive(fm_lock);
     }
     nvs_close(h);
@@ -748,6 +755,7 @@ int fm_unpair(void)
     fm_debug = false;
     memcpy(fm_pin, FM_PIN_DEFAULT, FM_PIN_LEN + 1);
     fm_pin_fail_count = 0;
+    fm_name[0] = '\0';
     pk_cache_valid = false;
     fm_adv_ms = FM_ADV_MS_DEFAULT;
     fm_rot_sec = FM_SLOT_SECONDS;
@@ -782,6 +790,48 @@ int fm_set_pin(const char *pin)
     if (rc == 0) {
         if (nvs_set_str(h, "pin", fm_pin) != ESP_OK) {
             rc = -1;
+        }
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    xSemaphoreGive(fm_lock);
+    return rc;
+}
+
+const char *fm_get_name(void)
+{
+    return fm_name;
+}
+
+/* Validation lives here (not in the console) so IDENT?/NAME and any future
+ * caller see the same rules: 1..FM_NAME_LEN chars of [A-Za-z0-9_-]. */
+int fm_set_name(const char *name)
+{
+    nvs_handle_t h;
+    size_t n;
+
+    if (name == NULL) {
+        return -1;
+    }
+    n = strlen(name);
+    if (n == 0 || n > FM_NAME_LEN) {
+        return -1;
+    }
+    for (size_t i = 0; i < n; i++) {
+        char c = name[i];
+        if (!(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') &&
+            !(c >= '0' && c <= '9') && c != '-' && c != '_') {
+            return -1;
+        }
+    }
+    if (xSemaphoreTake(fm_lock, portMAX_DELAY) != pdTRUE) {
+        return -2;
+    }
+    memcpy(fm_name, name, n + 1);
+    int rc = (nvs_open("fmkeys", NVS_READWRITE, &h) != ESP_OK) ? -2 : 0;
+    if (rc == 0) {
+        if (nvs_set_str(h, "name", fm_name) != ESP_OK) {
+            rc = -2;
         }
         nvs_commit(h);
         nvs_close(h);

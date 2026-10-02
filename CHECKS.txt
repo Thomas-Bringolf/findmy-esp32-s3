@@ -18,8 +18,11 @@ Conventions:
 [ ] idf.py build completes with no warnings/errors
 [ ] idf.py build output: binary fits the app partition (>40% free)
 [ ] python3 -m py_compile Scripts/findmy-toolbox.py  -> no output, rc 0
-[ ] TB help  -> lists all 16 commands, rc 0
+[ ] TB help  -> lists all 20 commands, rc 0
 [ ] TB (no args) with piped input "0" -> menu opens and quits, rc 0
+[ ] TB apple-id status -> "connected as <you>" / "not connected", rc 0
+[ ] TB apple-id disconnect (no TTY, no --yes) -> refuses, rc 1
+[ ] TB connect --no-reset on a sleeping device -> "no beacon answered", rc 1
 [ ] idf.py -p PORT flash -> "Hash of data verified", board resets
 [ ] after flash: TB devices shows the device, PIN column populated
 [ ] a freshly flashed/erased board boots with factory PIN 00000000
@@ -28,8 +31,8 @@ Conventions:
 --------------------------------------------------------------------------------
 1. UART CONSOLE - FRAMING AND PROTOCOL
 --------------------------------------------------------------------------------
-Automated (69 checks, ~4 min, resets + re-pairs the device):
-[ ] TB test                       -> 69/69 checks passed, rc 0
+Automated (79 checks, ~4 min, resets + re-pairs the device):
+[ ] TB test                       -> 79/79 checks passed, rc 0
 [ ] TB test --no-reset            -> same, when the console is already up
 [ ] TB test with a wrong --pin    -> aborts cleanly with a message, rc 1
 
@@ -44,7 +47,12 @@ Manual / ad-hoc (open a console session with TB unlock --reset, then):
 [ ] "CONFIG abc 120 600" / "2000x" / "-1" / "+2000" / "4294967296" -> ERR ARGS
 [ ] "CONFIG  2000  120  600"   -> OK (repeated separators tolerated)
 [ ] reply prefixes parse as: PONG / OK / ERR / LOCKED / SLOT / KEY / STAT /
-    STATUS, while log lines "I (123) tag: ..." are skipped
+    STATUS / IDENT, while log lines "I (123) tag: ..." are skipped
+[ ] "IDENT?" (locked or unlocked) -> IDENT name=<token|-> paired=<0|1>
+[ ] "IDENT? junk"                 -> ERR ARGS (answered even while locked)
+[ ] "NAME bike-tag" -> OK NAME bike-tag; "NAME" / "NAME a b" / "NAME has!"
+    / 17 chars -> ERR ARGS, previous name untouched; IDENT? reflects it
+[ ] WIPE erases the name (IDENT name=- paired=0)
 [ ] command latency 60-200 ms; "KEY?" and "KEYS" up to ~6 s (P-224
     derivation ~2.2 s, cached per slot) -> host timeout must be >= 6 s
 [ ] "KEYS" with 6 tokens, "PIN x y", "UNLOCK 12345678 junk", "DEBUG 1 1"
@@ -155,6 +163,11 @@ Manual / ad-hoc (open a console session with TB unlock --reset, then):
 --------------------------------------------------------------------------------
 [ ] TB retrieve                 -> "restored saved session", query window per
     slot, deduplicated append to state/reports.json, rc 0
+[ ] TB apple-id connect <id>    -> (first login: password + 2FA) session file
+    written mode 600; a second run reuses it without asking
+[ ] TB apple-id disconnect      -> asks to confirm (y/N) on a TTY, deletes
+    state/account_state.json, retrieve then asks for a login again
+[ ] TB apple-id disconnect --yes / on a pipe -> no prompt, file gone, rc 0
 [ ] TB retrieve <apple_id>      -> only needed when state/account_state.json
     is missing/expired (first login: password + 2FA)
 [ ] incremental: the query window starts at the newest archived slot and
@@ -223,6 +236,8 @@ Manual / ad-hoc (open a console session with TB unlock --reset, then):
 [ ] docs/firmware.md: state machine, config mode, NVS keys pin/pinfails,
     FM_PIN_* constants, status byte row
 [ ] docs/power.md, docs/roadmap.md: no references to removed scripts
+[ ] no file references flash_esp32.sh (removed) and no doc says the toolbox
+    needs ESP-IDF (it needs only: pip install -r requirements.txt)
 [ ] Scripts/README.md describes the toolbox only; root README.md commands
     all run as printed
 
@@ -232,17 +247,19 @@ Manual / ad-hoc (open a console session with TB unlock --reset, then):
   1. python3 -m py_compile Scripts/findmy-toolbox.py
   2. (IDF) idf.py build && idf.py -p /dev/ttyACM0 flash
   3. Scripts/findmy-toolbox.py devices
-  4. Scripts/findmy-toolbox.py test              # 69 checks, resets device
-  5. Scripts/findmy-toolbox.py pair --force
-  6. Scripts/findmy-toolbox.py sync && Scripts/findmy-toolbox.py sync-ble
-  7. Scripts/findmy-toolbox.py verify 15 && Scripts/findmy-toolbox.py scan 15
-  8. Scripts/findmy-toolbox.py power --dbg-sec 60 --seconds 45
-  9. Scripts/findmy-toolbox.py unlock --reset && Scripts/findmy-toolbox.py lock
- 10. Scripts/findmy-toolbox.py retrieve   (then --bg / --status / --follow /
-     --stop)
- 11. Scripts/findmy-toolbox.py monitor --once
- 12. Scripts/findmy-toolbox.py log --lines 20
- 13. grep -c "<current PIN>" Scripts/state/toolbox.log   # must be 0
+  4. Scripts/findmy-toolbox.py test              # 79 checks, resets device
+  5. Scripts/findmy-toolbox.py connect && Scripts/findmy-toolbox.py disconnect
+  6. Scripts/findmy-toolbox.py reset
+  7. Scripts/findmy-toolbox.py pair --force
+  8. Scripts/findmy-toolbox.py sync && Scripts/findmy-toolbox.py sync-ble
+  9. Scripts/findmy-toolbox.py verify 15 && Scripts/findmy-toolbox.py scan 15
+ 10. Scripts/findmy-toolbox.py power --dbg-sec 60 --seconds 45
+ 11. Scripts/findmy-toolbox.py unlock --reset && Scripts/findmy-toolbox.py lock
+ 12. Scripts/findmy-toolbox.py retrieve   (then --bg / --status / --follow /
+     --stop) and: apple-id status / connect / disconnect --yes
+ 13. Scripts/findmy-toolbox.py monitor --once
+ 14. Scripts/findmy-toolbox.py log --lines 20
+ 15. grep -c "<current PIN>" Scripts/state/toolbox.log   # must be 0
 
 Known limitations (by design):
   - reports stay at 0 until a locked iPhone is near the beacon

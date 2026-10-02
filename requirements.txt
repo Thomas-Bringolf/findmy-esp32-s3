@@ -1,0 +1,7 @@
+# Python dependencies for Scripts/findmy-toolbox.py
+# (the firmware in ESP32/ is built with ESP-IDF instead - see README.md)
+#
+#   pip install -r requirements.txt        # or --break-system-packages
+findmy>=0.10
+bleak>=0.19
+pyserial>=3.5

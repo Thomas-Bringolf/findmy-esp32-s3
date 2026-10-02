@@ -11,13 +11,14 @@ Protocol version: **`PONG fw=3`**.
 
 The console boots **locked** (`s_unlocked = false`, volatile — every reset
 starts locked again). While locked, the only commands that execute are
-`UNLOCK <pin>` and, on an already-unlocked device, `LOCK <pin>`; everything
-else — `PING` included — answers `LOCKED`. A locked device can therefore be
-probed for "is anyone there", but nothing else can be driven.
+`UNLOCK <pin>` and `IDENT?` (plus `LOCK <pin>` on an already-unlocked
+device); everything else — `PING` included — answers `LOCKED`. A locked
+device can therefore be probed for "is anyone there" *and* for "who are
+you", but nothing else can be driven.
 
 | State | Behaviour |
 |---|---|
-| **locked** (boot default) | every command → `LOCKED`; `UNLOCK <pin>` is the way out |
+| **locked** (boot default) | every command → `LOCKED` except `UNLOCK <pin>` and `IDENT?` |
 | **unlocked** | full command set; `dbg_sec` countdown is paused (console never expires) |
 | **locked again** (`LOCK <pin>`) | countdown restarts from `dbg_sec`; on expiry the device enters the normal sleep cycle |
 
@@ -134,6 +135,22 @@ LOCK   <8 digits>  -> OK LOCK   | ERR PIN | ERR ARGS | LOCKED
 `dbg_sec` countdown; when it expires the device publishes one normal frame
 and enters the sleep cycle (see [firmware.md](firmware.md)). Trailing
 tokens are `ERR ARGS`.
+
+### IDENT? / NAME
+```
+IDENT?            -> IDENT name=<token|-> paired=<0|1> | ERR ARGS
+NAME  <token>     -> OK NAME <token> | ERR ARGS | ERR NVS
+```
+The device's own name: up to `FM_NAME_LEN` (16) characters of
+`[A-Za-z0-9_-]`, `-` when it has none. It is what tells several beacons
+apart, so **`IDENT?` is answered even while the console is locked** — it
+carries no secret. `NAME` needs an unlocked console; a bad charset, an
+empty value or a trailing token is `ERR ARGS`, and the previous name stays.
+
+`NAME` is written to NVS (key `name`) and survives reboots and pairing;
+`WIPE` erases it together with everything else. `pair` sets it to the
+device id, which is why device ids are restricted to the same charset and
+length.
 
 ### PIN
 ```
@@ -253,12 +270,14 @@ PONG fw=3 paired=0
 OK KEYS
 > PIN 12345678
 OK PIN
+> IDENT?
+IDENT name=esp32-s3-test paired=1
 > SLOT?
 SLOT 0
 > LOCK 12345678
 OK LOCK
-> PING
-LOCKED
+> IDENT?
+IDENT name=esp32-s3-test paired=1     # still answered while locked
 > UNLOCK 12345678
 OK UNLOCK
 > WIPE
@@ -269,9 +288,11 @@ OK WIPE                            # reboots unpaired, factory PIN
 
 ```bash
 cd Scripts
-./findmy-toolbox.py pair                        # pair (keys + fresh PIN)
+./findmy-toolbox.py connect                     # find, identify (IDENT?), unlock
+./findmy-toolbox.py disconnect                  # lock the console again
+./findmy-toolbox.py reset                       # reboot over the control lines
+./findmy-toolbox.py pair --force                # pair/re-key (writes NAME too)
 ./findmy-toolbox.py sync --id esp32-s3-test     # read slot
-./findmy-toolbox.py unlock                      # leave the console unlocked
 ./findmy-toolbox.py test                        # edge cases (resets device)
 ```
 
@@ -282,6 +303,9 @@ session object auto-unlocks on open and auto-locks on close.
 ## Covered edge cases (`findmy-toolbox.py test`)
 
 - `LOCKED` gate: every command answered `LOCKED` before `UNLOCK`
+- `IDENT?` answered while locked, `IDENT? <extra>` → `ERR ARGS`
+- the device name: `NAME` set/get, empty/extra/oversized/bad-charset values
+  rejected, `WIPE` erases it
 - malformed input: bad numbers, extra tokens, unknown commands, empty lines
 - 400-character line dropped whole, device still responsive
 - wrong PIN (`ERR PIN`), malformed PIN (`ERR ARGS`), lockout (`ERR LOCK n`)

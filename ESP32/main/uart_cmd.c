@@ -413,10 +413,49 @@ static void handle_wipe(void)
     esp_restart();
 }
 
+/* Device identity: IDENT? reports name + pairing state and is the one
+ * read-only command the lock gate lets through, so a host can tell several
+ * beacons apart (or find an unpaired one) without knowing a PIN. NAME sets
+ * the name and needs an unlocked console. */
+static void handle_ident(char *extra)
+{
+    const char *name;
+
+    if (extra != NULL) {
+        reply("ERR ARGS");
+        return;
+    }
+    name = fm_get_name();
+    reply("IDENT name=%s paired=%d", name[0] ? name : "-",
+          fm_is_paired() ? 1 : 0);
+}
+
+static void handle_name(char *name)
+{
+    int rc;
+
+    if (name == NULL || strtok(NULL, " ") != NULL) {
+        reply("ERR ARGS");
+        return;
+    }
+    rc = fm_set_name(name);
+    if (rc == -1) {
+        reply("ERR ARGS");     /* charset or length outside FM_NAME_LEN */
+        return;
+    }
+    if (rc != 0) {
+        reply("ERR NVS");
+        return;
+    }
+    reply("OK NAME %s", name);
+}
+
 /* The lock gate: UNLOCK is the only command a locked console executes
  * (LOCK only answers "LOCKED"), everything else - PING included - is
  * refused with LOCKED, so a lost device can be probed for its state but
- * nothing else. Once unlocked, every command is available. */
+ * nothing else. IDENT? is the exception: it carries no secret and is what
+ * makes a multi-device host possible. Once unlocked, every command is
+ * available. */
 static void handle_line(char *line)
 {
     char *cmd = strtok(line, " ");
@@ -434,6 +473,10 @@ static void handle_line(char *line)
             return;
         }
         handle_lock(strtok(NULL, " "));
+        return;
+    }
+    if (strcmp(cmd, "IDENT?") == 0) {
+        handle_ident(strtok(NULL, " "));
         return;
     }
     if (!app_is_unlocked()) {
@@ -456,6 +499,8 @@ static void handle_line(char *line)
         handle_keys(a, b, c, d, e);
     } else if (strcmp(cmd, "PIN") == 0) {
         handle_pin(strtok(NULL, " "));
+    } else if (strcmp(cmd, "NAME") == 0) {
+        handle_name(strtok(NULL, " "));
     } else if (strcmp(cmd, "SLOT?") == 0) {
         handle_slot();
     } else if (strcmp(cmd, "KEY?") == 0) {

@@ -51,11 +51,14 @@ official key rotation, on-device P-224 derivation, UART pairing, no compiled-in 
 * 📲 **Retrieval built in** — `retrieve` logs in once, then fetches reports
   slot-by-slot with the saved session (no password, no 2FA afterwards) and can
   run as a background worker.
+* 🪪 **Self-identifying hardware** — every beacon carries its own name
+  (`NAME`), and `IDENT?` answers it **while the console is locked**, so
+  `connect` can tell several boards apart and pick the right PIN.
 * 🧪 **Hardware-in-the-loop test suite** — `test` exercises the lock gate,
-  malformed input, the PIN lockout, `CONFIG` clamping, sleep countdown and a
-  full `WIPE`+re-pair (**69/69 checks passing**).
-* 🧰 **One executable, 16 subcommands + an interactive menu** — no Makefile, no
-  script soup: [`Scripts/findmy-toolbox.py`](Scripts/README.md).
+  the device name, malformed input, the PIN lockout, `CONFIG` clamping,
+  sleep countdown and a full `WIPE`+re-pair (**79/79 checks passing**).
+* 🧰 **One executable, 20 subcommands + a state-driven menu** — no Makefile,
+  no script soup: [`Scripts/findmy-toolbox.py`](Scripts/README.md).
 
 ---
 
@@ -69,7 +72,7 @@ ESP32/                        ESP-IDF 6.1 firmware (the only thing needed from u
 ├── main/findmy_keys.c        X963 KDF, P-224 arithmetic, NVS key store, console PIN
 ├── main/beacon.h, config.h   shared declarations, timing constants, FM_STATUS_* masks
 ├── sdkconfig.defaults        ESP-IDF configuration used for the build
-└── flash_esp32.sh            upstream helper (optional; `idf.py` is enough)
+└── README.md                 upstream notes (build with `idf.py`)
 
 Scripts/
 ├── findmy-toolbox.py         🧰 the whole toolbox (pair, sync, retrieve, monitor, …)
@@ -78,6 +81,7 @@ Scripts/
 └── state/                    ⚠️ live data: keys, Apple session, GPS — NEVER COMMIT
 
 state_example/                ✅ fabricated stand-in for Scripts/state/ (git-tracked)
+requirements.txt              Python deps of the toolbox (findmy, bleak, pyserial)
 docs/                         the deep dives (links below)
 CHECKS.txt                    ✅ every system check, grouped and numbered
 ```
@@ -89,11 +93,12 @@ CHECKS.txt                    ✅ every system check, grouped and numbered
 ### 0 · Prerequisites
 
 ```bash
-# ESP-IDF v6.1 for the firmware
-source ~/.espressif/v6.1/esp-idf/export.sh
+# Python side (the toolbox): findmy, bleak, pyserial
+pip install --break-system-packages -r requirements.txt
 
-# Python side (toolbox + Find My protocol library)
-pip install --break-system-packages findmy bleak pyserial
+# ESP-IDF v6.1 - needed only to build/flash the firmware in ESP32/,
+# never by the toolbox itself
+source ~/.espressif/v6.1/esp-idf/export.sh
 ```
 
 Hardware: an **ESP32-S3** on `/dev/ttyACM0` (UART0 = GPIO&nbsp;43/44 over the
@@ -117,6 +122,9 @@ cd Scripts
 ./findmy-toolbox.py pair --force     # new keys + fresh random 8-digit PIN
 ./findmy-toolbox.py sync             # align the retrieval window to its slot
 ./findmy-toolbox.py devices          # list what you own
+
+./findmy-toolbox.py connect          # next time: identify (IDENT?) + unlock
+./findmy-toolbox.py disconnect       # ...and lock it again
 ```
 
 ### 3 · Follow it
@@ -130,7 +138,7 @@ cd Scripts
 ### 4 · Verify
 
 ```bash
-./findmy-toolbox.py test             # 69 protocol checks against the device
+./findmy-toolbox.py test             # 79 protocol checks against the device
 ./findmy-toolbox.py verify 15        # is our key actually on the air?
 ```
 
@@ -144,7 +152,7 @@ cd Scripts
 | 🔧 | [docs/firmware.md](docs/firmware.md) | state machine, NimBLE quirks, NVS layout, watchdogs, GPIO map |
 | ⚡ | [docs/power.md](docs/power.md) | `PWR` telemetry, measured duty cycle, current estimate, how to measure |
 | 🗺️ | [docs/roadmap.md](docs/roadmap.md) | what is implemented, what is deliberately missing, next steps |
-| 🧰 | [Scripts/README.md](Scripts/README.md) | the toolbox: all 16 subcommands, flags, menu |
+| 🧰 | [Scripts/README.md](Scripts/README.md) | the toolbox: all 20 subcommands, flags, menu |
 | ✅ | [CHECKS.txt](CHECKS.txt) | the full verification checklist (UART, BLE, timings, retrieval) |
 | 🧪 | [state_example/](state_example/) | what the (git-ignored) state folder looks like |
 | 📄 | [docs/papers/](docs/papers/) | the paper this protocol is based on (PDF, open access) |
@@ -162,7 +170,10 @@ cd Scripts
 
 | Command | Purpose |
 |---|---|
-| `pair` | generate keys on the PC, provision them, set a fresh PIN |
+| `pair` | generate keys on the PC, provision them, set a fresh PIN + name |
+| `connect` / `disconnect` | identify a beacon over UART (`IDENT?`) / lock it again |
+| `reset` | reboot a beacon over the control lines (wake it up) |
+| `apple-id` | save / forget the Apple ID session (`status`/`connect`/`disconnect`) |
 | `sync` / `sync-ble` | align the slot counter (USB / advertisement only) |
 | `devices` | list paired beacons |
 | `test` | hardware-in-the-loop protocol suite (resets the device) |
@@ -208,8 +219,8 @@ power-on / reset ──▶ locked session ──UNLOCK <pin>──▶ unlocked s
                         └─────────────────── wake ─▶ light-sleep loop (steady state)
 ```
 
-* Everything but `PING` answers `LOCKED` while locked; the lock is RAM state,
-  so every wake starts locked again.
+* Everything but `UNLOCK`/`LOCK` and `IDENT?` answers `LOCKED` while locked;
+  the lock is RAM state, so every wake starts locked again.
 * Steady state: one burst per `adv_ms`, light sleep the rest of the cycle,
   key advanced every `rot_sec` — **0.37&nbsp;% awake** (7.4&nbsp;ms / 1.99&nbsp;s),
   ≈ **2.2&nbsp;%** averaged with rotations.
@@ -228,11 +239,13 @@ holds an `flock` so only one instance ever runs.
 | Check | Result |
 |---|---|
 | `idf.py build` | ✅ clean, zero warnings (ESP-IDF 6.1) |
-| `findmy-toolbox.py test` | ✅ **69/69** (twice) |
+| `findmy-toolbox.py test` | ✅ **79/79** (twice) |
 | `sync` / `sync-ble` / `verify` / `scan` | ✅ slot matched from the advertisement |
 | `power --seconds 45` | ✅ 0.37&nbsp;% awake, 23 cycles |
 | `retrieve` (+ `--bg`/`--status`/`--follow`/`--stop`) | ✅ session restored, worker guarded |
-| `monitor` / `watch` / `log` / menu | ✅ |
+| `connect` / `disconnect` / `reset` / menu | ✅ name lookup, PIN trial, state-driven menu |
+| `apple-id connect` / `disconnect` | ✅ session saved and deleted again |
+| `monitor` / `watch` / `log` | ✅ |
 
 The complete, runnable list — including the regressions that were found and
 fixed — is in **[CHECKS.txt](CHECKS.txt)**.

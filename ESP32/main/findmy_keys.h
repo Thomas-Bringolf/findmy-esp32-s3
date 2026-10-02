@@ -27,6 +27,11 @@
 #define FM_PIN_LEN 8
 #define FM_PIN_DEFAULT "00000000"
 
+/* Device name: the console's human-readable identity, so a host can tell
+ * several beacons apart (IDENT?). FM_NAME_LEN characters from [A-Za-z0-9_-]
+ * at most, "" until the first NAME command. */
+#define FM_NAME_LEN 16
+
 /* UNLOCK anti-bruteforce: FM_PIN_FAIL_MAX wrong PINs in a row arm a
  * lockout of FM_PIN_LOCKOUT_BASE_S seconds that doubles with every further
  * failure, capped at FM_PIN_LOCKOUT_MAX_S. The failure counter lives in
@@ -63,6 +68,12 @@ int fm_unpair(void);
  * fm_set_pin() takes FM_PIN_LEN digits only, 0 on success. */
 const char *fm_get_pin(void);
 int fm_set_pin(const char *pin);
+
+/* Device name: never NULL, "" until the first NAME command (also cleared
+ * by fm_unpair()). fm_set_name() takes 1..FM_NAME_LEN chars of
+ * [A-Za-z0-9_-]; 0 on success, -1 on bad input, -2 when NVS refused. */
+const char *fm_get_name(void);
+int fm_set_name(const char *name);
 
 /* Wrong-UNLOCK attempt counter, persisted in NVS. */
 uint32_t fm_pin_fails(void);

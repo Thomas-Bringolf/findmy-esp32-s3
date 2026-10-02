@@ -61,7 +61,11 @@ nothing until it is reset.
 
 | Command | What it does |
 |---|---|
-| `pair` | generate keys on the PC, provision them, set a fresh PIN |
+| `pair` | generate keys on the PC, provision them, set a fresh PIN + name |
+| `connect` | find a beacon on the TTYs, identify it (`IDENT?`), unlock it |
+| `disconnect` | lock the console of the connected beacon |
+| `reset` | reboot a beacon over the UART control lines (wake it up) |
+| `apple-id` | `status` / `connect [apple-id]` / `disconnect` the saved session |
 | `sync` | read the current slot over USB (`SLOT?`/`KEY?`) |
 | `sync-ble` | same, from the BLE advertisement alone (no USB) |
 | `devices` | list paired devices |
@@ -87,8 +91,10 @@ nothing until it is reset.
 
 Generates fresh master key + SKN (primary chain only), sends them with
 `KEYS`, cross-checks the device's derived key against the `findmy` library,
-then rotates the PIN to a fresh random 8-digit one (`--new-pin` to choose)
-and stores everything in `state/devices.json`.
+tells the beacon its own name (`NAME <id>` — the id *is* the device name,
+so it must be 1…16 characters of `[A-Za-z0-9_-]`), then rotates the PIN to
+a fresh random 8-digit one (`--new-pin` to choose) and stores everything in
+`state/devices.json`.
 
 | Argument | Meaning |
 |---|---|
@@ -96,7 +102,8 @@ and stores everything in `state/devices.json`.
 | `--id NAME` | device id in `devices.json` (default `esp32-s3-test`) |
 | `--pin PIN` | PIN used to unlock the device |
 | `--new-pin PIN` | PIN to set after pairing (default: random) |
-| `--force` | overwrite an existing device id |
+| `--force` | overwrite an existing device id (asks to type `pair` on a TTY) |
+| `--yes` / `-y` | no confirmation for `--force` |
 | `--debug 0/1` | device debug flag right after pairing |
 | `--adv-ms N` / `--rot-sec N` / `--dbg-sec N` | config sent with the keys |
 
@@ -105,6 +112,53 @@ device's actual slot counter.
 
 See [../docs/uart-protocol.md](../docs/uart-protocol.md) for the console
 protocol itself (lock, PIN, `WIPE`, …).
+
+### connect / disconnect
+
+```bash
+./findmy-toolbox.py connect          # scan /dev/ttyACM* + /dev/ttyUSB*, ask IDENT?
+./findmy-toolbox.py connect --port /dev/ttyACM1
+./findmy-toolbox.py disconnect       # lock the console again
+```
+
+`connect` is how you attach to hardware you have not named yet:
+
+1. every serial port is probed with `IDENT?` — which the firmware answers
+   **even while the console is locked**; silent ports are woken with a reset
+   pulse (unless `--no-reset`);
+2. if more than one beacon answers, the named one is preferred, otherwise
+   you pick;
+3. the console is unlocked with the stored PIN (`--pin` overrides). For a
+   beacon whose name matches nothing in `devices.json`, the stored PINs are
+   tried — at most `4`, never enough to arm the firmware's 5-strike lockout —
+   and the winner is confirmed by comparing `KEY?` against the derived key
+   chain;
+4. the name is (re)written so the next `connect` recognises it instantly;
+5. an **unpaired** beacon is prompted for a name and offered a `pair`.
+
+The connection (id, port, name, paired?) lives for the menu process; every
+command still opens its own short session and locks the console on the way
+out.
+
+| Argument | Meaning |
+|---|---|
+| `--port PATH` | only this port (default: scan them all) |
+| `--id NAME` | connect this entry, refuse anything else |
+| `--pin PIN` | PIN to unlock with (default: stored) |
+| `--no-reset` | do not wake a silent beacon |
+| `--no-pair` | never offer to pair an unpaired beacon |
+
+`disconnect` is `lock` plus dropping the connection state.
+
+### reset
+
+```bash
+./findmy-toolbox.py reset             # reboot via DTR/RTS, wait for the console
+```
+
+Toggles the control lines (`pulse_reset()`), waits for the console to answer
+again and reports who came back (`IDENT?`). Use it to wake a beacon that
+sits in its sleep loop, or to restart a wedged one from the menu.
 
 ### sync / sync-ble
 
@@ -225,6 +279,24 @@ ones.
 | `--port PATH` | serial device (default: the stored port) |
 | `--reset` | pulse the reset line first |
 
+### apple-id
+
+```bash
+./findmy-toolbox.py apple-id status              # who is saved?
+./findmy-toolbox.py apple-id connect you@example.com
+./findmy-toolbox.py apple-id disconnect          # delete the session file
+./findmy-toolbox.py apple-id disconnect --yes    # non-interactive
+```
+
+`connect` logs in once (password + 2FA on the terminal) and stores the
+resulting session in `state/account_state.json`, so `retrieve`, `watch` and
+`monitor` never ask again. An existing session is reused as-is; passing a
+*different* address switches accounts (confirmed on a TTY, `--yes` to skip).
+
+`disconnect` deletes `state/account_state.json` — the next retrieval asks
+for a login again. That only forgets the session on this machine; revoke
+the app-specific password at apple.com if you want it gone everywhere.
+
 ### log
 
 ```bash
@@ -242,14 +314,38 @@ secrets redacted (keys, passwords, PINs).
 ./findmy-toolbox.py          # no arguments: numbered menu, prompt-driven
 ```
 
-The menu runs the same subcommands and reports the same status line;
-`-v`/`--verbose` is a CLI option (before or after the command).
+The menu is driven by the current state. The status block at the top always
+shows the two connections:
+
+```
+console : connected to 'esp32-s3-test' on /dev/ttyACM0 (paired)
+apple   : connected as you@example.com
+```
+
+and the entries change with them:
+
+* **no console connected** → only the commands that do not need UART
+  (`devices`, `sync-ble`, `retrieve`, `watch`, `monitor`, `verify`, `scan`,
+  `log`, `help`), plus `connect` and `reset`, plus `apple connect`;
+* **connected** → the console commands appear (`sync`, `test`, `power`,
+  `pin`, `pair`, `wipe`, `disconnect`, `reset`), each already bound to the
+  connected device's `--id`/`--port`;
+* **Apple ID saved** → the entry flips to `apple disconnect`.
+
+Pick a number, or type a command name by hand. `connect` sets the
+connection, `disconnect` and `wipe` clear it (a wiped beacon has to be
+identified and paired again). `-v`/`--verbose` is a CLI option (before or
+after the command).
 
 ## Dependencies
 
 ```bash
-pip install --break-system-packages findmy bleak pyserial
+pip install -r ../requirements.txt          # findmy, bleak, pyserial
+# or: pip install --break-system-packages findmy bleak pyserial
 ```
+
+No ESP-IDF needed here — that toolchain is only for building and flashing
+the firmware in `ESP32/`.
 
 ## Archived scripts
 

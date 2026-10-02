@@ -36,7 +36,8 @@ static int64_t s_deadline_us;
   device never sleeps: the console is reachable until a real PIN is set.
 - **`app_update_status()`** — recomputes the status byte
   (`FM_STATUS_UNLOCKED`, `FM_STATUS_CONFIG`) after `KEYS`/`PIN`/`WIPE`.
-- `uart_cmd.c` refuses every command except `UNLOCK` while locked
+- `uart_cmd.c` refuses every command except `UNLOCK` and `IDENT?` while
+  locked — `IDENT?` is how a host tells two beacons apart without a PIN
   ([uart-protocol.md](uart-protocol.md)).
 
 ## State machine
@@ -155,6 +156,7 @@ device was off.
 | `advms`, `rotsec`, `dbgsec` | u32 | config (clamped on load *and* write) |
 | `pin` | blob(8) | console PIN (8 digits; factory default `00000000`) |
 | `pinfails` | u32 | consecutive failed `UNLOCK` attempts |
+| `name` | str | device name for `IDENT?` (1..16 of `[A-Za-z0-9_-]`, `""` = none) |
 
 `fm_unpair()` (the `WIPE` command) erases the whole namespace — keys, config,
 **PIN and failure counter** — and resets the in-RAM config to the

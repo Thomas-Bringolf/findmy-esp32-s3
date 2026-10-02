@@ -7,7 +7,8 @@ this pass; the rest are proposals.
 
 - Console protocol hardened and fully tested: strict numeric parsing,
   overflow-safe line reader, `WIPE`, `fw=2`, pairing window never consumed
-  by a failed `KEYS` — `Scripts/test_uart.py` covers 63 checks.
+  by a failed `KEYS` — now `findmy-toolbox.py test` (79 checks); the old
+  standalone `Scripts/old/test_uart.py` is archived.
 - Key rotation in the debug window actually runs (it used to wait for a GAP
   event NimBLE never sends) — verified with three rotations in 60 s.
 - Power: steady-state duty cycle 100 % → **0.37 % awake per cycle**
@@ -15,10 +16,15 @@ this pass; the rest are proposals.
   ([power.md](power.md)).
 - WIPE regression fixed: the unpaired device no longer writes zeroed key
   blobs back to NVS, so a `CONFIG` + reboot keeps `paired=0`.
-- `Scripts/measure_power.py` for repeatable duty-cycle measurements.
+- `Scripts/old/measure_power.py` for repeatable duty-cycle measurements.
 - P-224 public key now cached per slot (`fm_current_pubkey`): `KEY?` and
   `CONFIG` went from 2.2 s to 60–130 ms, which also removed the intermittent
   host-timeout/off-by-one failures in the UART suite.
+
+- Device identity + state-driven menu: `NAME`/`IDENT?` in the firmware
+  (`IDENT?` is answered **while locked**), toolbox `connect` / `disconnect` /
+  `reset`, `apple-id connect|disconnect`, and a menu that only offers what the
+  current connections allow.
 
 ## Power
 

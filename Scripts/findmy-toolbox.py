@@ -9,6 +9,10 @@ Usage:
 
 Commands:
     pair       pair a beacon over UART (keys + PIN, stores devices.json)
+    connect    find a beacon on the TTYs, identify it, unlock its console
+    disconnect lock the console of the connected beacon
+    reset      reboot a beacon over the UART control lines (wake it up)
+    apple-id   connect or disconnect the Apple ID session
     sync       sync the slot counter over USB
     sync-ble   sync the slot counter from the BLE advertisement
     devices    list paired devices
@@ -27,6 +31,9 @@ Commands:
 
 State lives in state/ (devices.json, reports.json, account_state.json,
 toolbox.log, retrieve.lock). Logging goes to stderr and state/toolbox.log.
+
+Only Python packages are needed here (see requirements.txt); ESP-IDF is for
+building and flashing the firmware in ESP32/ and is not used by this tool.
 """
 import argparse
 import asyncio
@@ -66,8 +73,16 @@ DEFAULT_DEVICE = ""
 MAX_BACKTRACK_SLOTS = 30
 RETRIEVE_SLEEP_S = 90
 PIN_LEN = 8
+PIN_FAIL_MAX = 5           # firmware FM_PIN_FAIL_MAX (before a lockout)
+NAME_LEN = 16              # firmware FM_NAME_LEN
 
-MARKERS = ("PONG", "OK ", "ERR", "SLOT ", "KEY ", "STAT ", "STATUS ", "LOCKED")
+MARKERS = ("PONG", "OK ", "ERR", "SLOT ", "KEY ", "STAT ", "STATUS ",
+           "IDENT ", "LOCKED")
+
+# Process-wide console connection state: what 'connect' identified, so the
+# menu can offer the UART commands that need a known device. Every command
+# still opens its own session; nothing is held open between menu steps.
+CONNECTED: dict | None = None
 LOG_PREFIX = re.compile(r"^[IVDEW] \(\d+\) [^:]+: ")
 
 RESET = "\033[0m"
@@ -314,6 +329,18 @@ def fresh_device_entry(dev_id: str, port: str, master: bytes, skn: bytes,
     }
 
 
+def valid_name(name: str) -> bool:
+    """The device name the firmware accepts: 1..NAME_LEN of [A-Za-z0-9_-]."""
+    return (bool(name) and len(name) <= NAME_LEN
+            and re.fullmatch(r"[A-Za-z0-9_-]+", name) is not None)
+
+
+def sanitize_name(value: str) -> str:
+    """Closest legal device name for `value` (may be empty if nothing fits)."""
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "-", value.strip())[:NAME_LEN]
+    return cleaned.strip("-")
+
+
 def accessory_class():
     from findmy.accessory import FindMyAccessory
 
@@ -405,8 +432,9 @@ def fmt_age(seconds: float) -> str:
     if s < 86400:
         h, m = divmod(s, 3600)
         return f"{h}h{m // 60:02d}min"
-    d, h = divmod(s, 86400)
-    return f"{d}d{h}h"
+    d, rem = divmod(s, 86400)
+    h, _m = divmod(rem, 3600)
+    return f"{d}d{h:02d}h"
 
 
 def fmt_dur(seconds: float) -> str:
@@ -664,19 +692,33 @@ def cmd_pair(args) -> int:
         log_error(channel, f"'{dev_id}' is already in {DEVICES_JSON.name} "
                            f"(use --force to re-pair)")
         return 1
+    if existing and args.force and sys.stdin.isatty() and not args.yes:
+        ui(f"'{dev_id}' already has keys - pairing again replaces them on the "
+           f"device and in {DEVICES_JSON.name}", YELLOW)
+        if prompt(f"type 'pair' to re-key '{dev_id}'", "n").lower() != "pair":
+            ui("cancelled - nothing was changed", DIM)
+            log(channel, "re-pair cancelled")
+            return 0
 
     port = resolve_port(args.port, existing)
     pin = unlock_pin_for(existing, args.pin)
     adv_ms = args.adv_ms or 2000
     rot_sec = args.rot_sec or 120
     dbg_sec = args.dbg_sec if args.dbg_sec is not None else 600
+    if not valid_name(dev_id):
+        raise UserError(f"--id must be a device name: 1..{NAME_LEN} "
+                        f"characters from [A-Za-z0-9_-], got '{dev_id}'")
 
+    # From a connection the console stays open (the menu keeps working on
+    # it); a plain CLI run locks the device again when it is done.
+    keep_open = CONNECTED is not None and CONNECTED.get("port") == port
     log(channel, f"pairing '{dev_id}' on {port}")
     master = secrets.token_bytes(28)
     skn = secrets.token_bytes(32)
     b64 = lambda x: base64.b64encode(x).decode()
 
     beacon = Beacon(port, pin, dev_id=dev_id, channel=channel,
+                    auto_lock=not keep_open,
                     pin_from_flag=args.pin is not None)
     try:
         beacon.after_open(reset=args.reset)
@@ -697,6 +739,13 @@ def cmd_pair(args) -> int:
         if got != expected:
             raise UserError(f"key mismatch device={got} findmy={expected}")
 
+        # The device learns its own name here: IDENT? then tells every host
+        # which beacon it is, locked console or not.
+        reply = beacon.cmd(f"NAME {dev_id}")
+        if not reply.startswith("OK NAME"):
+            raise UserError(f"the console refused the device name: {reply} - "
+                            f"is the firmware up to date? (idf.py flash)")
+
         if args.debug is not None:
             beacon.cmd(f"DEBUG {1 if args.debug else 0}")
         beacon.cmd("STATUS?")
@@ -711,6 +760,9 @@ def cmd_pair(args) -> int:
 
         save_entry(fresh_device_entry(dev_id, port, master, skn, paired_at,
                                       new_pin, adv_ms, rot_sec, dbg_sec))
+        if CONNECTED is not None and CONNECTED.get("port") == port:
+            CONNECTED.update({"id": dev_id, "name": dev_id, "paired": True,
+                              "pin": new_pin})
     finally:
         beacon.close()
 
@@ -988,6 +1040,12 @@ def cmd_test(args) -> int:
             beacon.lock(pin0)
             reply = beacon.cmd("PING")
         suite.check("PING while locked -> LOCKED", reply == "LOCKED", reply)
+        ident = beacon.cmd("IDENT?")
+        suite.check("IDENT? is answered while locked",
+                    ident.startswith("IDENT name="), ident)
+        reply = beacon.cmd("IDENT? extra")
+        suite.check("IDENT? with extra args -> ERR ARGS",
+                    reply == "ERR ARGS", reply)
         for cmd, name in (("KEY?", "KEY?"), ("WIPE", "WIPE"),
                           ("STAT?", "STAT?"), ("DEBUG 1", "DEBUG"),
                           ("CONFIG 2000 120 600", "CONFIG")):
@@ -1133,6 +1191,36 @@ def cmd_test(args) -> int:
         reply = beacon.cmd(f"PIN {pin_final}")
         suite.check("PIN while unpaired -> ERR UNPAIRED",
                     reply.startswith("ERR UNPAIRED"), reply)
+
+        suite.step("P3b: the device name (IDENT?/NAME)")
+        reply = beacon.cmd("IDENT?")
+        suite.check("name erased by WIPE -> IDENT name=- paired=0",
+                    reply == "IDENT name=- paired=0", reply)
+        name = dev_id if valid_name(dev_id) else (
+            sanitize_name(dev_id) or "test-beacon")
+        if name != dev_id:
+            log(channel, f"'{dev_id}' is no device name - using '{name}' on "
+                         f"the console", logging.WARNING)
+        reply = beacon.cmd(f"NAME {name}")
+        suite.check(f"NAME {name} -> OK NAME", reply == f"OK NAME {name}", reply)
+        reply = beacon.cmd("IDENT?")
+        suite.check("IDENT? reports the new name",
+                    reply == f"IDENT name={name} paired=0", reply)
+        reply = beacon.cmd("NAME")
+        suite.check("NAME without a value -> ERR ARGS",
+                    reply == "ERR ARGS", reply)
+        reply = beacon.cmd("NAME two tokens")
+        suite.check("NAME with extra args -> ERR ARGS",
+                    reply == "ERR ARGS", reply)
+        reply = beacon.cmd("NAME has!invalid")
+        suite.check("NAME outside [A-Za-z0-9_-] -> ERR ARGS",
+                    reply == "ERR ARGS", reply)
+        reply = beacon.cmd("NAME " + "x" * (NAME_LEN + 1))
+        suite.check(f"NAME longer than {NAME_LEN} -> ERR ARGS",
+                    reply == "ERR ARGS", reply)
+        reply = beacon.cmd("IDENT?")
+        suite.check("a refused NAME leaves the name alone",
+                    reply == f"IDENT name={name} paired=0", reply)
 
         mk2, skn2 = gen_keys()
         reply = beacon.cmd(f"KEYS {b64e(mk2)} {b64e(skn2)}", wait=8)
@@ -1497,6 +1585,18 @@ async def apple_login(apple_id: str | None, channel: str):
         pass
     log(channel, f"session saved to {SESSION_FILE}")
     return account
+
+
+def session_account_name() -> str | None:
+    """Apple ID of the saved session (None when there is no session)."""
+    if not SESSION_FILE.exists():
+        return None
+    try:
+        account = json.loads(SESSION_FILE.read_text()).get("account", {})
+    except (OSError, json.JSONDecodeError):
+        return None
+    return account.get("info", {}).get("account_name") or account.get(
+        "username")
 
 
 def print_new_report(dev_id: str, d: dict) -> None:
@@ -2101,6 +2201,426 @@ def cmd_pin(args) -> int:
     return 0
 
 
+def parse_ident(reply: str) -> dict | None:
+    """'IDENT name=<tok|-> paired=<0|1>' -> {'name': str|None, 'paired': bool}."""
+    if not reply.startswith("IDENT "):
+        return None
+    fields = {}
+    for token in reply.split()[1:]:
+        if "=" in token:
+            key, value = token.split("=", 1)
+            fields[key] = value
+    name = fields.get("name", "-")
+    return {"name": None if name == "-" else name,
+            "paired": fields.get("paired") == "1"}
+
+
+def expected_key_at(dev: dict, slot: int) -> str:
+    """Advertising key X of the stored device `dev` at key slot `slot`."""
+    from findmy.accessory import FindMyAccessory
+
+    acc = FindMyAccessory(
+        master_key=base64.b64decode(dev["master_key"]),
+        skn=base64.b64decode(dev["skn"]),
+        sks=b"\x00" * 32,
+        paired_at=parse_time(dev["paired_at"]),
+        name="t", identifier="t",
+    )
+    return acc._primary_key_at(slot).adv_key_bytes.hex()
+
+
+def scan_ports(prefer: str | None = None) -> list[str]:
+    """Serial ports that may hold a beacon, the preferred one first."""
+    import glob
+
+    found = {p for pattern in ("/dev/ttyACM*", "/dev/ttyUSB*")
+             for p in glob.glob(pattern)}
+    ordered: list[str] = []
+    if prefer:
+        ordered.append(prefer)
+        found.discard(prefer)
+    return ordered + sorted(found)
+
+
+def probe_ident(port: str, *, channel: str = "CONNECT",
+                reset: bool = False) -> dict | None:
+    """IDENT? on the beacon at `port`. None when it stays silent (asleep,
+    not flashed, or not a console). Never unlocks anything."""
+    try:
+        beacon = Beacon(port, None, channel=channel, auto_unlock=False,
+                        auto_lock=False, timeout=1.0)
+        try:
+            beacon.after_open(reset=reset,
+                              ready_timeout=5.0 if reset else 2.5)
+            reply = beacon.cmd("IDENT?", wait=1.0)
+        finally:
+            beacon.close()
+    except (BeaconError, OSError) as exc:
+        log(channel, f"{port}: no console ({exc})", logging.DEBUG)
+        return None
+    ident = parse_ident(reply)
+    if ident is None:
+        log(channel, f"{port}: unexpected answer to IDENT? ({reply})",
+            logging.DEBUG)
+    else:
+        log(channel, f"{port} answers {reply}", logging.DEBUG)
+    return ident
+
+
+def choose_beacon(found: list[tuple[str, dict]]) -> tuple[str, dict]:
+    """One beacon from the ones that answered (or a UserError)."""
+    if len(found) == 1:
+        return found[0]
+    named = [(p, i) for p, i in found if i["name"]]
+    if len(named) == 1:
+        return named[0]
+    if not sys.stdin.isatty():
+        raise UserError(f"several beacons answer ({', '.join(p for p, _ in found)}) "
+                        f"- pick one with --port")
+    print("several beacons answer:")
+    for number, (candidate, ident) in enumerate(found, 1):
+        print(f"  {number}) {(ident['name'] or 'unnamed'):<16} {candidate}")
+    while True:
+        raw = prompt("beacon", "1")
+        if raw.isdigit() and 1 <= int(raw) <= len(found):
+            return found[int(raw) - 1]
+        for candidate, ident in found:
+            if raw in (candidate, ident["name"] or ""):
+                return candidate, ident
+        print(paint(RED, "  a number from the list, a port or a name", ui=True))
+
+
+def match_paired_device(port: str, *, channel: str = "CONNECT") -> dict | None:
+    """A paired beacon without a usable name: try the stored PINs and keep
+    the entry whose key chain answers. Stops at PIN_FAIL_MAX - 1 attempts so
+    the trial can never arm the console's lockout on its own."""
+    data = load_devices()
+    entries = sorted(data["devices"], key=lambda d: d.get("port") != port)
+    for index, dev in enumerate(entries):
+        if index >= PIN_FAIL_MAX - 1:
+            log(channel, f"stopped after {index} PIN attempt(s) - the console "
+                         f"locks out after {PIN_FAIL_MAX} wrong PINs in a row",
+                logging.WARNING)
+            break
+        pin = device_pin(dev)
+        try:
+            beacon = Beacon(port, pin, dev_id=dev["id"], channel=channel,
+                            auto_unlock=False, auto_lock=False,
+                            pin_from_flag=True)
+            try:
+                beacon.after_open(reset=False, ready_timeout=3.0)
+                beacon.unlock(pin)
+                slot_reply = beacon.cmd("SLOT?")
+                key_reply = beacon.cmd("KEY?", wait=8)
+            finally:
+                beacon.close()
+        except (BeaconError, OSError) as exc:
+            log(channel, f"PIN trial '{dev['id']}': {exc}", logging.DEBUG)
+            continue
+        if not slot_reply.startswith("SLOT ") or not key_reply.startswith("KEY "):
+            continue
+        try:
+            slot = int(slot_reply.split()[1])
+            got = key_reply.split()[1]
+            if got == expected_key_at(dev, slot):
+                log(channel, f"the beacon on {port} is '{dev['id']}' (slot {slot})")
+                return dev
+        except (IndexError, ValueError) as exc:
+            log(channel, f"unreadable key state: {exc}", logging.DEBUG)
+    return None
+
+
+def open_console(port: str, pin: str, dev_id: str | None, *,
+                 channel: str, pin_from_flag: bool) -> Beacon:
+    """Unlocked console session, left unlocked when it is closed."""
+    beacon = Beacon(port, pin, dev_id=dev_id, channel=channel,
+                    auto_unlock=False, auto_lock=False,
+                    pin_from_flag=pin_from_flag)
+    try:
+        beacon.after_open(reset=False, ready_timeout=5.0)
+        beacon.unlock(pin)
+    except Exception:
+        beacon.close()
+        raise
+    return beacon
+
+
+def console_key_matches(beacon: Beacon, entry: dict, port: str) -> bool:
+    """True when the console's key chain is the one stored for `entry`."""
+    slot_reply = beacon.cmd("SLOT?")
+    key_reply = beacon.cmd("KEY?", wait=8)
+    if not slot_reply.startswith("SLOT ") or not key_reply.startswith("KEY "):
+        raise UserError(f"the console on {port} has no key chain to check "
+                        f"({slot_reply} / {key_reply})")
+    try:
+        slot = int(slot_reply.split()[1])
+        got = key_reply.split()[1]
+        want = expected_key_at(entry, slot)
+    except (IndexError, ValueError) as exc:
+        raise UserError(f"unreadable key state on {port}: "
+                        f"{slot_reply} / {key_reply}") from exc
+    if got != want:
+        log("CONNECT", f"{port} slot {slot}: {got} != the stored chain {want}",
+            logging.DEBUG)
+        return False
+    return True
+
+
+def set_device_name(beacon: Beacon, name: str) -> None:
+    reply = beacon.cmd(f"NAME {name}")
+    if not reply.startswith("OK NAME"):
+        raise UserError(f"the console refused the name '{name}': {reply}")
+
+
+def connect_uart(*, port: str | None = None, dev_id: str | None = None,
+                 pin: str | None = None, reset: bool = True,
+                 ask_pair: bool = True, channel: str = "CONNECT") -> dict:
+    """Find a beacon, work out which device it is and unlock its console.
+
+    Returns {id, port, name, paired, pin}; the module-level CONNECTED is set
+    as soon as the console is open (so a pairing started from here stays
+    unlocked) and cleared when no beacon can be identified. Raises
+    UserError when nothing usable answers.
+    """
+    global CONNECTED
+    CONNECTED = None
+    data = load_devices()
+    entry = find_device(data, dev_id) if dev_id else None
+    if dev_id and entry is None:
+        raise UserError(f"'{dev_id}' is not in {DEVICES_JSON.name} - run "
+                        f"'pair' first, or drop --id to identify the beacon")
+    ports = [port] if port else scan_ports(port or (entry or {}).get("port"))
+    if not ports:
+        raise UserError("no serial ports found (looked for /dev/ttyACM* and "
+                        "/dev/ttyUSB*)")
+
+    found: list[tuple[str, dict]] = []
+    for candidate in ports:
+        ident = probe_ident(candidate, channel=channel, reset=False)
+        if ident:
+            found.append((candidate, ident))
+    if not found and reset:
+        for candidate in ports:
+            ident = probe_ident(candidate, channel=channel, reset=True)
+            if ident:
+                found.append((candidate, ident))
+    if not found:
+        raise UserError(
+            f"no beacon answered on {', '.join(ports)} - flashed, powered and "
+            f"cabled? ('reset' wakes one up, --no-reset skips the wake-up)")
+
+    chosen_port, ident = choose_beacon(found)
+    log(channel, f"beacon on {chosen_port}: "
+                 f"name={ident['name'] or '-'} paired={int(ident['paired'])}")
+    if dev_id and ident["name"] and ident["name"] != dev_id:
+        raise UserError(f"{chosen_port} identifies as '{ident['name']}', not "
+                        f"'{dev_id}' - drop --id or check the cable")
+
+    if ident["paired"]:
+        by_name = find_device(data, ident["name"]) if ident["name"] else None
+        if by_name:
+            entry = by_name
+        if entry is None:
+            entry = match_paired_device(chosen_port, channel=channel)
+            if entry is None:
+                raise UserError(
+                    f"the beacon on {chosen_port} is paired, but nothing in "
+                    f"{DEVICES_JSON.name} matches it - re-key it with 'pair "
+                    f"--force --id <name> --port {chosen_port}' or start over "
+                    f"with 'wipe'")
+        beacon = open_console(chosen_port, unlock_pin_for(entry, pin),
+                              entry["id"], channel=channel,
+                              pin_from_flag=pin is not None)
+        try:
+            if not console_key_matches(beacon, entry, chosen_port):
+                beacon.close()
+                other = match_paired_device(chosen_port, channel=channel)
+                if other is None:
+                    raise UserError(
+                        f"{chosen_port} opened with '{entry['id']}'s PIN but "
+                        f"advertises another key chain - check 'devices'")
+                entry = other
+                beacon = open_console(chosen_port, unlock_pin_for(entry, pin),
+                                      entry["id"], channel=channel,
+                                      pin_from_flag=pin is not None)
+            if valid_name(entry["id"]) and ident["name"] != entry["id"]:
+                set_device_name(beacon, entry["id"])
+                log(channel, f"device name healed to '{entry['id']}'")
+        finally:
+            beacon.close()
+        conn = {"id": entry["id"], "port": chosen_port, "name": entry["id"],
+                "paired": True, "pin": device_pin(entry)}
+        CONNECTED = conn
+        return conn
+
+    # Unpaired beacon: config mode, factory PIN (unless --pin says otherwise).
+    unlock_pin = pin or DEFAULT_PIN
+    beacon = open_console(chosen_port, unlock_pin, dev_id, channel=channel,
+                          pin_from_flag=pin is not None)
+    try:
+        if ident["name"] and valid_name(ident["name"]):
+            name = ident["name"]
+        else:
+            suggested = dev_id or ident["name"] or (
+                DEFAULT_ID if not data["devices"] else "")
+            name = sanitize_name(
+                prompt(f"device name for the beacon on {chosen_port}",
+                       suggested or None))
+            if not valid_name(name):
+                raise UserError(f"the name must be 1..{NAME_LEN} characters "
+                                f"from [A-Za-z0-9_-], got '{name}'")
+            set_device_name(beacon, name)
+        conn = {"id": name, "port": chosen_port, "name": name,
+                "paired": False, "pin": unlock_pin}
+        CONNECTED = conn
+    finally:
+        beacon.close()
+
+    ui(f"\n'{name}' on {chosen_port} is unpaired (config mode)", YELLOW + BOLD)
+    ui(f"the console is unlocked with {unlock_pin}", DIM)
+    if ask_pair and sys.stdin.isatty():
+        if prompt(f"pair '{name}' now?", "y").lower() in ("y", "yes"):
+            pair_args = build_parser().parse_args(
+                ["pair", "--id", name, "--port", chosen_port, "--reset"])
+            pair_args.yes = True       # "pair now?" was already answered
+            if pin:
+                pair_args.pin = pin
+            if find_device(load_devices(), name) is not None:
+                pair_args.force = True
+            if COMMANDS["pair"](pair_args) == 0:
+                conn = CONNECTED or conn
+                conn.update({"paired": True, "name": name,
+                             "pin": find_device(load_devices(), name)
+                             ["pin"]})
+            else:
+                ui("pairing failed - the console stays unlocked, run 'pair' "
+                   "to retry", YELLOW)
+        else:
+            ui(f"not paired - 'pair --id {name} --port {chosen_port}' when "
+               f"you are ready", DIM)
+    elif ask_pair:
+        ui(f"unpaired: run 'pair --id {name} --port {chosen_port}'", DIM)
+    return conn
+
+
+def cmd_connect(args) -> int:
+    channel = "CONNECT"
+    log(channel, "looking for a beacon")
+    conn = connect_uart(port=args.port, dev_id=args.id, pin=args.pin,
+                        reset=not args.no_reset, ask_pair=not args.no_pair,
+                        channel=channel)
+    state = "unpaired (config mode)" if not conn["paired"] else "paired"
+    ui(f"\nconnected to '{conn['id']}' on {conn['port']} - {state}",
+       GREEN + BOLD)
+    ui(f"  console   : unlocked; it locks itself again after the countdown",
+       DIM)
+    ui(f"  menu      : run the toolbox without a command for the console menu",
+       DIM)
+    return 0
+
+
+def cmd_disconnect(args) -> int:
+    global CONNECTED
+    if CONNECTED and not args.id:
+        args.id = CONNECTED["id"]
+        args.port = args.port or CONNECTED["port"]
+    rc = cmd_lock(args)
+    if rc == 0:
+        CONNECTED = None
+        ui("disconnected - the beacon locks itself after the countdown", DIM)
+        ui("run 'connect' to identify it again", DIM)
+    return rc
+
+
+def cmd_reset(args) -> int:
+    channel = "MAIN"
+    data = load_devices()
+    device = None
+    if args.id:
+        device = find_device(data, args.id)
+    elif data["devices"]:
+        device = find_device(data, pick_device(data, None, required=False) or "")
+    port = resolve_port(args.port, device)
+
+    log(channel, f"rebooting the device on {port} over the control lines")
+    beacon = Beacon(port, None, channel=channel, auto_unlock=False,
+                    auto_lock=False, timeout=1.0)
+    try:
+        beacon.pulse_reset()
+        if not beacon.wait_ready(20.0):
+            raise UserError(f"{port} did not come back after the reset - "
+                            f"cable, power or the wrong port?")
+        ident = parse_ident(beacon.cmd("IDENT?", wait=1.0))
+    finally:
+        beacon.close()
+
+    who = (ident or {}).get("name") or "unnamed"
+    paired = "paired" if (ident or {}).get("paired") else "unpaired"
+    ui(f"{port} rebooted ({who}, {paired})", GREEN + BOLD)
+    ui("it boots locked - 'connect' opens the console again", DIM)
+    if CONNECTED is not None and CONNECTED.get("port") == port:
+        ui("the connection was cleared, run 'connect' to return", YELLOW)
+    return 0
+
+
+def cmd_apple(args) -> int:
+    channel = "APPLE"
+    existing = session_account_name()
+
+    if args.action == "status":
+        if existing:
+            ui(f"Apple ID: connected as {existing}", GREEN + BOLD)
+            ui(f"  session : {SESSION_FILE.relative_to(SCRIPTS_DIR)}", DIM)
+        else:
+            ui("Apple ID: not connected (no saved session)", YELLOW)
+            ui("  run 'apple-id connect' (or the menu) to log in", DIM)
+        return 0
+
+    if args.action == "disconnect":
+        if existing is None and not SESSION_FILE.exists():
+            ui("Apple ID: not connected - nothing to disconnect")
+            return 0
+        if not args.yes:
+            if not sys.stdin.isatty():
+                raise UserError("deleting the Apple ID session needs --yes")
+            if prompt(f"delete the saved session for "
+                      f"{existing or 'this Apple ID'}", "n").lower() not in (
+                          "y", "yes"):
+                ui("cancelled - the session is unchanged", DIM)
+                return 0
+        SESSION_FILE.unlink()
+        log(channel, f"Apple ID session for {existing or 'unknown'} deleted")
+        ui("Apple ID disconnected: the saved session is gone", GREEN + BOLD)
+        ui(f"  {SESSION_FILE.relative_to(SCRIPTS_DIR)} deleted; retrieve/watch "
+           f"will ask for a login again", DIM)
+        ui("  this only forgets the session locally - use apple.com to "
+           "revoke access elsewhere", DIM)
+        return 0
+
+    if existing and args.email and args.email != existing:
+        if not args.yes:
+            if not sys.stdin.isatty():
+                raise UserError("switching accounts needs --yes "
+                                "(it deletes the saved session)")
+            if prompt(f"forget the session saved for {existing} and log in as "
+                      f"{args.email}", "n").lower() not in ("y", "yes"):
+                ui("cancelled - the session is unchanged", DIM)
+                return 0
+        SESSION_FILE.unlink()
+        log(channel, f"forgetting the session for {existing}")
+        existing = None
+
+    account = asyncio.run(apple_login(args.email, channel))
+    if account is None:
+        log_error(channel, "no Apple ID session - login did not finish")
+        return 1
+    name = getattr(account, "account_name", None) or args.email or existing
+    ui(f"Apple ID connected as {name or 'you'}", GREEN + BOLD)
+    ui(f"  session : {SESSION_FILE.relative_to(SCRIPTS_DIR)}", DIM)
+    ui("  retrieve/watch/monitor can fetch reports now", DIM)
+    return 0
+
+
 def cmd_unlock(args) -> int:
     channel = "MAIN"
     data = load_devices()
@@ -2216,6 +2736,10 @@ HELP_TEXT = """\
 findmy-toolbox.py - everything for the ESP32-S3 Find My beacon
 
   pair       pair a beacon over UART (keys + fresh PIN -> devices.json)
+  connect    find a beacon on the TTYs, identify it (IDENT?), unlock it
+  disconnect lock the console of the beacon 'connect' opened
+  reset      reboot a beacon over the UART control lines (wake it up)
+  apple-id   status | connect [apple-id] | disconnect  (saved session)
   sync       sync the slot counter over USB
   sync-ble   sync the slot counter from the BLE advertisement
   devices    list paired devices
@@ -2233,11 +2757,19 @@ findmy-toolbox.py - everything for the ESP32-S3 Find My beacon
   pin        set a new console PIN
   unlock     unlock the console (device left unlocked)
   lock       lock the console (device left locked)
-  wipe       factory reset: erase keys + PIN, unpair (--yes to confirm)
+  wipe       factory reset: erase keys + PIN (--yes to confirm)
   log        show or follow state/toolbox.log
   help       show this overview
 
+Run it without a command for the interactive menu: it shows what is
+connected (console + Apple ID) and only offers the commands that make
+sense in that state.
+
 Options before or after the command: -v/--verbose (debug logging).
+
+Needs Python packages only (pip install -r requirements.txt): bleak,
+pyserial, findmy. ESP-IDF is for building/flashing the firmware in ESP32/,
+not for this tool.
 
 State: state/{devices.json,reports.json,account_state.json,toolbox.log,
 retrieve.lock}. Logs go to stderr and state/toolbox.log (secrets redacted).
@@ -2251,6 +2783,10 @@ def cmd_help(args) -> int:
 
 COMMANDS = {
     "pair": cmd_pair,
+    "connect": cmd_connect,
+    "disconnect": cmd_disconnect,
+    "reset": cmd_reset,
+    "apple-id": cmd_apple,
     "sync": cmd_sync,
     "sync-ble": cmd_sync_ble,
     "devices": cmd_devices,
@@ -2270,33 +2806,68 @@ COMMANDS = {
 }
 
 COMMAND_CHANNEL = {
-    "pair": "PAIR", "sync": "SYNC", "sync-ble": "SYNC-BLE", "devices": "MAIN",
-    "test": "TEST", "power": "POWER", "retrieve": "RETRIEVE", "watch": "RETRIEVE",
-    "monitor": "MONITOR", "verify": "VERIFY", "scan": "SCAN", "pin": "MAIN",
-    "unlock": "MAIN", "lock": "MAIN", "wipe": "MAIN", "log": "MAIN", "help": "UI",
+    "pair": "PAIR", "connect": "CONNECT", "disconnect": "MAIN",
+    "reset": "MAIN", "apple-id": "APPLE", "sync": "SYNC", "sync-ble": "SYNC-BLE",
+    "devices": "MAIN", "test": "TEST", "power": "POWER", "retrieve": "RETRIEVE",
+    "watch": "RETRIEVE", "monitor": "MONITOR", "verify": "VERIFY", "scan": "SCAN",
+    "pin": "MAIN", "unlock": "MAIN", "lock": "MAIN", "wipe": "MAIN",
+    "log": "MAIN", "help": "UI",
 }
 
-MENU_ENTRIES = [
-    ("pair", "pair a beacon over UART"),
-    ("sync", "sync the slot counter (USB)"),
-    ("sync-ble", "sync the slot counter from BLE"),
-    ("devices", "list paired devices"),
-    ("test", "console protocol test suite"),
-    ("power", "awake/sleep duty cycle"),
-    ("retrieve", "fetch location reports"),
-    ("watch", "retrieve + keep polling"),
-    ("monitor", "live dashboard"),
-    ("verify", "check the advertisement on air"),
-    ("scan", "raw BLE scan"),
-    ("pin", "set a new console PIN"),
-    ("unlock", "unlock the console (left unlocked)"),
-    ("lock", "lock the console (left locked)"),
-    ("wipe", "factory reset: erase keys + PIN"),
-    ("log", "show or follow toolbox.log"),
+# The menu is built from these: the first group never needs the console, the
+# last one only appears with a connection (or offers 'connect' without one).
+MENU_ALWAYS = [
+    ("devices", "list paired devices", []),
+    ("sync-ble", "sync the slot counter from BLE", []),
+    ("retrieve", "fetch location reports", []),
+    ("watch", "retrieve + keep polling", []),
+    ("monitor", "live dashboard", []),
+    ("verify", "check the advertisement on air", []),
+    ("scan", "raw BLE scan", []),
+    ("log", "show or follow toolbox.log", []),
+    ("help", "show the command overview", []),
+]
+
+MENU_CONSOLE = [
+    ("sync", "sync the slot counter (USB)", []),
+    ("test", "console protocol test suite", []),
+    ("power", "awake/sleep duty cycle", []),
+    ("pin", "set a new console PIN", []),
+    ("pair", "re-pair the connected beacon (new keys)", ["--force"]),
+    ("wipe", "factory reset: erase keys + PIN", []),
+    ("disconnect", "lock the console, drop the connection", []),
 ]
 
 
-def status_lines() -> list[str]:
+def menu_sections(conn: dict | None) -> list[tuple[str, list[tuple]]]:
+    """(title, entries) for the current connection state. Every entry's argv
+    is complete: [command, ...its own flags]."""
+    always = [(name, description, [name] + argv)
+              for name, description, argv in MENU_ALWAYS]
+    apple = session_account_name()
+    if apple:
+        apple_entries = [("apple disconnect",
+                          f"forget the saved session ({apple})",
+                          ["apple-id", "disconnect"])]
+    else:
+        apple_entries = [("apple connect", "log in with an Apple ID",
+                          ["apple-id", "connect"])]
+    if conn:
+        common = ["--id", conn["id"], "--port", conn["port"]]
+        uart = [(name, description, [name] + argv + common)
+                for name, description, argv in MENU_CONSOLE]
+        uart.append(("reset", "reboot the connected beacon",
+                     ["reset", "--port", conn["port"]]))
+        title = f"console ({conn['id']} on {conn['port']})"
+    else:
+        uart = [("connect", "find, identify and unlock a beacon", ["connect"]),
+                ("reset", "reboot a beacon (wake it up)", ["reset"])]
+        title = "console"
+    return [("no uart needed", always), ("apple id", apple_entries),
+            (title, uart)]
+
+
+def status_lines(conn: dict | None = None) -> list[str]:
     p = lambda color, text: paint(color, text, ui=True)
     try:
         devices = load_devices().get("devices", [])
@@ -2321,7 +2892,18 @@ def status_lines() -> list[str]:
     elif info:
         worker = p(YELLOW, "stale lock file")
 
+    console = p(YELLOW, "not connected")
+    if conn:
+        state = "paired" if conn.get("paired") else "unpaired"
+        console = p(GREEN, f"connected to '{conn['id']}' on {conn['port']} "
+                           f"({state})")
+    apple = session_account_name()
+    apple_line = (p(GREEN, f"connected as {apple}") if apple
+                  else p(YELLOW, "not connected"))
+
     lines = [
+        p(DIM, f"console : {console}"),
+        p(DIM, f"apple   : {apple_line}"),
         p(DIM, f"devices : {len(devices)}"
                + (f" ({', '.join(d['id'] for d in devices)})" if devices else "")),
         p(DIM, f"reports : {report_count}"
@@ -2336,6 +2918,7 @@ def status_lines() -> list[str]:
 def menu() -> int:
     p = lambda color, text: paint(color, text, ui=True)
     width = 74
+    global CONNECTED
     try:
         while True:
             sys.stdout.write("\033[2J\033[H")
@@ -2343,34 +2926,53 @@ def menu() -> int:
             title = " ESP32 FIND MY - TOOLBOX "
             print(p(CYAN + BOLD, f"║{title}{' ' * (width - 2 - len(title))}║"))
             print(p(CYAN + BOLD, f"╚{'═' * (width - 2)}╝"))
-            for line in status_lines():
+            for line in status_lines(CONNECTED):
                 print("  " + line)
             print()
-            for i, (name, description) in enumerate(MENU_ENTRIES, 1):
-                print(f"  {i:>2}) {name:<9} {description}")
+
+            entries: list[tuple[str, str, list[str]]] = []
+            for section, items in menu_sections(CONNECTED):
+                if not items:
+                    continue
+                print(p(BOLD, f"  {section}:"))
+                for name, description, argv in items:
+                    entries.append((name, description, argv))
+                    print(f"  {len(entries):>2}) {name:<16} {description}")
+                print()
             print("   0) quit")
             print()
             choice = input(p(BOLD, "> ")).strip().lower()
             if choice in ("0", "q", "quit", "exit"):
                 log("UI", "menu closed")
                 return 0
-            name = None
-            if choice.isdigit() and 1 <= int(choice) <= len(MENU_ENTRIES):
-                name = MENU_ENTRIES[int(choice) - 1][0]
-            elif choice in COMMANDS:
-                name = choice
-            if name is None:
+            picked = None
+            if choice.isdigit() and 1 <= int(choice) <= len(entries):
+                picked = entries[int(choice) - 1]
+            else:
+                for item in entries:
+                    if choice == item[0]:
+                        picked = item
+                        break
+            if picked is None and choice in COMMANDS:
+                picked = (choice, "", [choice])   # type any command by hand
+            if picked is None:
                 print(p(RED, f"unknown choice '{choice}'"))
                 time.sleep(1.0)
                 continue
-            log("UI", f"menu: {name}")
-            args = build_parser().parse_args([name])
+
+            name, _description, argv = picked
+            log("UI", f"menu: {' '.join(argv)}")
+            args = build_parser().parse_args(argv)
             try:
-                rc = COMMANDS[name](args)
+                rc = COMMANDS[argv[0]](args)
             except (UserError, BeaconError, OSError) as exc:
                 print(p(RED, f"\n{exc}"))
-                log_error(COMMAND_CHANNEL.get(name, "MAIN"), str(exc))
+                log_error(COMMAND_CHANNEL.get(argv[0], "MAIN"), str(exc))
                 rc = 1
+            if argv[0] == "wipe" and rc == 0:
+                CONNECTED = None     # the beacon is unnamed and unpaired now
+            elif argv[0] == "reset" and CONNECTED:
+                CONNECTED = None     # it rebooted, the console was closed
             if rc:
                 print(p(YELLOW, f"\n{name} exited with status {rc}"))
             input(p(DIM, "\npress Enter to return to the menu "))
@@ -2401,13 +3003,45 @@ def build_parser() -> argparse.ArgumentParser:
     pair.add_argument("--new-pin", help=f"PIN to set after pairing "
                                         f"({PIN_LEN} digits, default: random)")
     pair.add_argument("--force", action="store_true",
-                      help="overwrite an existing device id")
+                      help="overwrite an existing device id (confirms on a TTY)")
+    pair.add_argument("--yes", "-y", action="store_true",
+                      help="no confirmation for --force on a terminal")
     pair.add_argument("--debug", type=int, choices=[0, 1], default=None,
                       help="device debug flag after pairing")
     pair.add_argument("--adv-ms", type=int,
                       help="advertisement period in ms (200..60000)")
     pair.add_argument("--rot-sec", type=int, help="key rotation period (s)")
     pair.add_argument("--dbg-sec", type=int, help="console countdown (s)")
+
+    connect = sub.add_parser("connect", parents=[verbose],
+                             help="identify + unlock a beacon over UART")
+    connect.add_argument("--port")
+    connect.add_argument("--id", help="device id to connect to (default: identify)")
+    connect.add_argument("--pin", help="PIN to unlock with (default: stored)")
+    connect.add_argument("--no-reset", action="store_true",
+                         help="do not pulse reset to wake a silent beacon")
+    connect.add_argument("--no-pair", action="store_true",
+                         help="never offer to pair an unpaired beacon")
+
+    disconnect = sub.add_parser("disconnect", parents=[verbose],
+                                help="lock the console of the connected beacon")
+    disconnect.add_argument("--port")
+    disconnect.add_argument("--id")
+    disconnect.add_argument("--pin")
+
+    reset = sub.add_parser("reset", parents=[verbose],
+                           help="reboot a beacon over the UART control lines")
+    reset.add_argument("--port")
+    reset.add_argument("--id")
+
+    apple = sub.add_parser("apple-id", parents=[verbose],
+                           help="connect or disconnect the Apple ID session")
+    apple.add_argument("action", nargs="?", default="status",
+                       choices=("status", "connect", "disconnect"))
+    apple.add_argument("email", nargs="?", default=None,
+                       help="Apple ID to log in as (with 'connect')")
+    apple.add_argument("--yes", "-y", action="store_true",
+                       help="no confirmation for disconnect/account switch")
 
     sync = sub.add_parser("sync", parents=[verbose],
                           help="sync the slot counter over USB")
@@ -2509,7 +3143,8 @@ def build_parser() -> argparse.ArgumentParser:
     log_parser.add_argument("--lines", type=int, default=50)
     log_parser.add_argument("--follow", action="store_true")
 
-    for name in ("pair", "sync", "power", "pin", "unlock", "lock", "wipe"):
+    for name in ("pair", "sync", "power", "pin", "unlock", "lock", "wipe",
+                 "disconnect"):
         sub.choices[name].add_argument(
             "--reset", action="store_true",
             help="pulse the reset line first (device asleep / no console)")
