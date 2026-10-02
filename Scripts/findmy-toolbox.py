@@ -21,7 +21,7 @@ Commands:
     retrieve   fetch location reports  (--bg/--status/--doctor/--follow)
     watch      retrieve and keep polling
     monitor    live dashboard
-    verify     check the advertisement on air
+    verify     spec-check the advertisement on air
     scan       raw BLE scan for Find My packets
     pin        set a new console PIN
     unlock     unlock the console (device left unlocked)
@@ -398,13 +398,53 @@ def derive_expected(master: bytes, skn: bytes, paired_at: datetime) -> str:
 
 def beacon_mac(key) -> str:
     b = key.adv_key_bytes
-    addr = (b[0] | 0xC0, b[1], b[2], b[3], b[4], (b[5] & 0x3F) | 0xC0)
-    return ":".join(f"{x:02X}" for x in reversed(addr))
+    return ":".join(f"{x:02X}" for x in bytes([b[0] | 0xC0, *b[1:6]]))
 
 
 OF_TYPE = 0x12
 OF_LEN = 0x19
+OF_HEADER = 2
 APPLE_MFR = 0x004C
+OF_MFR_LEN = OF_HEADER + OF_LEN
+STATUS_BITS = 0x03
+
+
+def legacy_mac(key) -> str:
+    """Address ordering of the pre-fix firmware, kept only as a fingerprint.
+
+    The first NimBLE build put `key[0] | 0b11` into the *last* displayed
+    octet instead of the first, so a beacon still running that firmware is
+    recognised by this string - `verify` uses it to name the byte-order bug
+    instead of just reporting "no beacon".
+    """
+    b = key.adv_key_bytes
+    return ":".join(
+        f"{x:02X}" for x in bytes([*reversed(b[:5]), (b[5] & 0x3F) | 0xC0]))
+
+
+def reconstruct_key(mac: str, mfr: bytes) -> bytes | None:
+    """Rebuild the 28-byte advertising key the way a Find My finder does.
+
+    The address carries `key[0]` with its top two bits forced to `0b11`, so
+    those two bits have to come back out of the payload's high-bits byte:
+    `key = (mfr[25] << 6 | mac[0] & 0x3F) || mac[1..5] || mfr[3..24]`.
+    Same construction as findmy's
+    `SeparatedOfflineFindingDevice.from_payload` and paper Table 2.
+    """
+    if len(mfr) != OF_MFR_LEN or mac.count(":") != 5:
+        return None
+    try:
+        octets = bytes(int(x, 16) for x in mac.split(":"))
+    except ValueError:
+        return None
+    if len(octets) != 6:
+        return None
+    start = ((mfr[25] & 0x03) << 6) | (octets[0] & 0x3F)
+    return bytes([start, *octets[1:6], *mfr[3:25]])
+
+
+def norm_mac(mac: str) -> str:
+    return mac.replace("-", ":").upper()
 
 
 def payload_matches(mfr: bytes, key) -> bool:
@@ -416,6 +456,76 @@ def payload_matches(mfr: bytes, key) -> bool:
     if len(mfr) != len(expected):
         return False
     return mfr[:2] == expected[:2] and mfr[3:] == expected[3:]
+
+
+def frame_spec_checks(mac: str, mfr: bytes) -> list[tuple[str, bool, str]]:
+    """Static frame checks that do not depend on which key we hold."""
+    checks: list[tuple[str, bool, str]] = []
+
+    def add(name: str, ok: bool, got: str = "") -> None:
+        checks.append((name, ok, got))
+
+    add("manufacturer data under Apple id 0x004C", True, "packet selected")
+    add("OF type byte is 0x12",
+        len(mfr) > 0 and mfr[0] == OF_TYPE,
+        f"got {mfr[0]:#04x}" if mfr else "no data")
+    add("OF length byte is 0x19 (25)",
+        len(mfr) > 1 and mfr[1] == OF_LEN,
+        f"got {mfr[1]:#04x}" if len(mfr) > 1 else "no data")
+    add(f"mfr length is {OF_MFR_LEN} (2 + 25)",
+        len(mfr) == OF_MFR_LEN, f"got {len(mfr)}")
+
+    octets = mac.split(":")
+    plausible = (len(octets) == 6
+                 and all(len(o) == 2 and all(c in "0123456789ABCDEF"
+                                             for c in o.upper())
+                         for o in octets))
+    add("MAC is 6 hex octets", plausible, mac)
+    if plausible:
+        first = int(octets[0], 16)
+        add("random static address: top two bits are 0b11",
+            first & 0xC0 == 0xC0, f"first octet {first:#04x}")
+    if len(mfr) == OF_MFR_LEN:
+        add("status byte uses only defined bits (0x03)",
+            mfr[2] & ~STATUS_BITS == 0, f"status {status_decode(mfr[2])}")
+        add("hint byte is 0x00", mfr[26] == 0, f"hint {mfr[26]:#04x}")
+    return checks
+
+
+def key_spec_checks(mac: str, mfr: bytes, key, dev_id: str,
+                    slot: int) -> list[tuple[str, bool, str]]:
+    """Frame-vs-`devices.json` checks: the ones the byte order bug hides in."""
+    checks: list[tuple[str, bool, str]] = []
+    want = key.adv_key_bytes
+
+    def add(name: str, ok: bool, got: str = "") -> None:
+        checks.append((name, ok, got))
+
+    if len(mfr) != OF_MFR_LEN:
+        add("payload key suffix == devices.json key[6:28]", False,
+            f"frame is {len(mfr)} bytes, not {OF_MFR_LEN}")
+        return checks
+
+    suffix = mfr[3:25]
+    add(f"payload suffix == {dev_id} slot {slot} key[6:28]",
+        suffix == want[6:28], suffix.hex())
+    add("payload high-bits byte == key[0] >> 6",
+        mfr[25] == want[0] >> 6,
+        f"frame {mfr[25]:#04x}, key {want[0] >> 6:#04x}")
+
+    rebuilt = reconstruct_key(mac, mfr)
+    add("reconstructed public key == devices.json key",
+        rebuilt == want,
+        f"rebuilt {rebuilt.hex() if rebuilt else '?'}")
+
+    add("beacon_mac() == advertised MAC", beacon_mac(key) == norm_mac(mac),
+        f"{beacon_mac(key)} vs {norm_mac(mac)}")
+    add("beacon_mac() == findmy mac_address (spec cross-check)",
+        beacon_mac(key) == norm_mac(key.mac_address),
+        f"{beacon_mac(key)} vs {key.mac_address}")
+    add("findmy of_data() agrees with the frame body",
+        payload_matches(mfr, key), "type/len/key/high-bits/hint")
+    return checks
 
 
 def status_decode(status_byte: int) -> str:
@@ -2133,38 +2243,44 @@ def cmd_monitor(args) -> int:
         return 0
 
 
-async def verify_scan(duration: float, targets: dict) -> dict:
+async def verify_scan(duration: float) -> list[dict]:
+    """Collect every Apple Offline Finding advertisement in the window.
+
+    Deliberately unfiltered: a packet that fails to match a known key is
+    evidence too (wrong byte order, wrong slot, foreign accessory), so the
+    caller decides what a packet means rather than dropping it here.
+    """
     from bleak import BleakScanner
 
-    found = {"ok": False, "mac": None, "got": None, "rssi": None, "status": None}
+    packets: list[dict] = []
 
     def cb(device, adv):
         mfr = adv.manufacturer_data.get(APPLE_MFR)
         if mfr is None:
             return
-        key = targets.get(device.address.upper())
-        if key is None:
-            return
-        found["mac"], found["got"] = device.address, mfr.hex()
-        if len(mfr) > 2:
-            found["status"] = mfr[2]
-        if payload_matches(mfr, key):
-            found.update(ok=True, rssi=adv.rssi)
+        packets.append({"mac": norm_mac(device.address), "mfr": bytes(mfr),
+                        "rssi": adv.rssi, "name": device.name})
 
     scanner = BleakScanner(detection_callback=cb)
     await scanner.start()
     await asyncio.sleep(duration)
     await scanner.stop()
-    return found
+    return packets
 
 
-def rotating_targets(channel: str) -> dict:
+def slot_keys(channel: str) -> dict[str, tuple[str, int, object]]:
+    """Recent slot keys of every paired device, indexed by key hex.
+
+    Indexed by the *key* rather than by its MAC on purpose: matching a packet
+    to a key must not go through `beacon_mac`, otherwise a wrong address
+    ordering would only ever be compared against itself.
+    """
     data = load_devices()
     devices = data["devices"]
     if not devices:
         raise UserError(f"no devices in {DEVICES_JSON.name} - run 'pair' first")
     now = datetime.now(timezone.utc)
-    out: dict = {}
+    out: dict[str, tuple[str, int, object]] = {}
     for dev in devices:
         acc = make_accessory(dev)
         max_i = acc.get_max_index(now)
@@ -2172,49 +2288,124 @@ def rotating_targets(channel: str) -> dict:
         log(channel, f"{dev['id']}: accepting slots {min_i}..{max_i}")
         for ind in range(min_i, max_i + 1):
             key = acc._primary_key_at(ind)
-            out[beacon_mac(key)] = key
+            out[key.adv_key_bytes.hex()] = (dev["id"], ind, key)
     return out
 
 
 def cmd_verify(args) -> int:
     channel = "VERIFY"
     try:
-        targets = rotating_targets(channel)
+        index = slot_keys(channel)
     except UserError as exc:
         log_error(channel, str(exc))
         return 1
-    log(channel, f"expecting {len(targets)} known key(s)/MAC(s), "
-                 f"scanning {args.seconds:g}s")
-    ui(f"expecting {len(targets)} known key(s)/MAC(s)")
-    ui(f"Scanning {args.seconds:g}s ...")
+    by_mac = {norm_mac(beacon_mac(entry[2])): entry
+              for entry in index.values()}
+    by_legacy = {norm_mac(legacy_mac(entry[2])): entry
+                 for entry in index.values()}
+    devices = {entry[0] for entry in index.values()}
+    log(channel, f"expecting {len(index)} known key(s) over "
+                 f"{len(devices)} device(s), scanning {args.seconds:g}s")
+    ui(f"expecting {len(index)} known key(s), scanning {args.seconds:g}s ...")
     try:
-        res = asyncio.run(verify_scan(args.seconds, targets))
+        packets = asyncio.run(verify_scan(args.seconds))
     except PermissionError:
         log_error(channel, "BLE scan needs permissions - run with sudo")
         return 1
 
     ui("")
-    if res["ok"]:
-        log(channel, f"beacon advertises a key we hold (mac={res['mac']}, "
-                     f"rssi={res['rssi']} dBm, status={status_decode(res['status'])})")
-        ui("PASS: beacon advertises a key we hold", GREEN + BOLD)
-        ui(f"  MAC   : {res['mac']}")
-        ui(f"  RSSI  : {res['rssi']} dBm")
-        ui(f"  status: {status_decode(res['status']) if res['status'] is not None else '?'}")
-        return 0
-    if res["mac"]:
-        log_error(channel, f"MAC {res['mac']} seen but payload differs "
-                           f"(status {status_decode(res['status'])})")
-        ui(f"FAIL: MAC {res['mac']} seen but payload differs!", RED + BOLD)
-        ui(f"  received: {res['got']}")
-        if res["status"] is not None:
-            ui(f"  status  : {status_decode(res['status'])}")
-        return 2
-    log_error(channel, "no known beacon MAC seen - unpaired, powered off, or "
-                       "slot too old? run 'sync' or 'sync-ble'")
-    ui("FAIL: no known beacon MAC seen (unpaired? powered? slot too old - "
-       "run 'sync')", RED + BOLD)
-    return 1
+    if not packets:
+        log_error(channel, "no Apple Offline Finding advertisement seen at all")
+        ui("FAIL: no Offline Finding advertisement seen (beacon off, "
+           "adapter blind, or too far)", RED + BOLD)
+        return 1
+
+    match = None
+    for packet in packets:
+        rebuilt = reconstruct_key(packet["mac"], packet["mfr"])
+        entry = index.get(rebuilt.hex()) if rebuilt else None
+        if entry is not None:
+            match = (packet, entry)
+            break
+
+    if match is None:
+        return report_verify_miss(channel, packets, by_mac, by_legacy)
+
+    packet, (dev_id, slot, key) = match
+    status = packet["mfr"][2] if len(packet["mfr"]) > 2 else None
+    log(channel, f"packet {packet['mac']} rssi={packet['rssi']} dBm "
+                 f"status={status_decode(status) if status is not None else '?'} "
+                 f"-> {dev_id} slot {slot}")
+    ui(f"packet : {packet['mac']}  rssi={packet['rssi']} dBm  "
+       f"status={status_decode(status) if status is not None else '?'}")
+    ui(f"key    : {key.adv_key_bytes.hex()}")
+    ui(f"device : {dev_id}  slot {slot}")
+    ui("")
+
+    suite = Suite(channel)
+    suite.step("frame: static specification (paper Tab. 2, config.h)")
+    for name, ok, detail in frame_spec_checks(packet["mac"], packet["mfr"]):
+        suite.check(name, ok, detail)
+    suite.step("frame: public key against devices.json")
+    for name, ok, detail in key_spec_checks(packet["mac"], packet["mfr"],
+                                             key, dev_id, slot):
+        suite.check(name, ok, detail)
+
+    ui("")
+    if suite.failed:
+        log_error(channel, f"{len(suite.failed)} check(s) failed")
+        ui("FAIL: advertisement on air does not match the spec / "
+           "devices.json", RED + BOLD)
+        return 3
+    log(channel, f"PASS: {len(suite.results)} checks, {dev_id} slot {slot}")
+    ui("PASS: advertisement matches the spec and devices.json",
+       GREEN + BOLD)
+    return 0
+
+
+def report_verify_miss(channel: str, packets: list[dict], by_mac: dict,
+                       by_legacy: dict) -> int:
+    """Explain a packet that did not reconstruct to a key we hold."""
+    for packet in packets:
+        entry = by_legacy.get(packet["mac"])
+        if entry:
+            dev_id, slot, _ = entry
+            log_error(channel, f"{packet['mac']} matches {dev_id} slot {slot} "
+                               f"in the reversed byte order")
+            ui("FAIL: our key is on air in the WRONG byte order",
+               RED + BOLD)
+            ui(f"  MAC    : {packet['mac']}")
+            ui(f"  device : {dev_id}  slot {slot}")
+            ui("  the address must be (key[0]|0b11) || key[1..5] in display "
+               "order (paper Tab. 2); NimBLE stores it little-endian",
+               DIM)
+            return 2
+    for packet in packets:
+        entry = by_mac.get(packet["mac"])
+        if entry:
+            dev_id, slot, key = entry
+            rebuilt = reconstruct_key(packet["mac"], packet["mfr"])
+            status = packet["mfr"][2] if len(packet["mfr"]) > 2 else 0
+            log_error(channel, f"{packet['mac']} is {dev_id} slot {slot} but "
+                               f"payload differs (rebuilt "
+                               f"{rebuilt.hex() if rebuilt else '?'})")
+            ui(f"FAIL: MAC {packet['mac']} seen but payload differs!",
+               RED + BOLD)
+            ui(f"  device : {dev_id}  slot {slot}")
+            ui(f"  on air : {packet['mfr'].hex()}")
+            ui(f"  want   : {key.of_data(status=status, hint=0).hex()}")
+            ui(f"  key    : {key.adv_key_bytes.hex()}", DIM)
+            return 2
+    log_error(channel, f"{len(packets)} Offline Finding packet(s) seen, none "
+                       f"of them ours - unpaired, powered off, or slot too "
+                       f"old? run 'sync' or 'sync-ble'")
+    ui(f"FAIL: saw {len(packets)} OF packet(s) but none belongs to a key we "
+       "hold (unpaired? slot too old? run 'sync')", RED + BOLD)
+    for packet in packets[:5]:
+        rebuilt = reconstruct_key(packet["mac"], packet["mfr"])
+        ui(f"  {packet['mac']}  rssi={packet['rssi']:>4}  "
+           f"rebuild={rebuilt.hex() if rebuilt else '?'}", DIM)
+    return 2
 
 
 def parse_of_payload(data: bytes) -> dict | None:
@@ -2873,7 +3064,7 @@ findmy-toolbox.py - everything for the ESP32-S3 Find My beacon
                --doctor   do known reports still come back?
   watch      retrieve and keep polling (default every 120 s)
   monitor    live dashboard (Ctrl-C to quit)
-  verify     check the advertisement on air
+  verify     spec-check the advertisement on air
   scan       raw BLE scan for Find My packets
   pin        set a new console PIN
   unlock     unlock the console (device left unlocked)
@@ -2944,7 +3135,7 @@ MENU_ALWAYS = [
     ("doctor", "account check: known reports return", ["retrieve", "--doctor"]),
     ("watch", "retrieve + keep polling", ["watch"]),
     ("monitor", "live dashboard", ["monitor"]),
-    ("verify", "check the advertisement on air", ["verify"]),
+    ("verify", "spec-check the advertisement on air", ["verify"]),
     ("scan", "raw BLE scan", ["scan"]),
     ("log", "show or follow toolbox.log", ["log"]),
     ("help", "show the command overview", ["help"]),
@@ -3251,8 +3442,17 @@ def build_parser() -> argparse.ArgumentParser:
     monitor.add_argument("--device")
     monitor.add_argument("--once", action="store_true")
 
-    verify = sub.add_parser("verify", parents=[verbose],
-                            help="check the advertisement on air")
+    verify = sub.add_parser(
+        "verify", parents=[verbose],
+        help="spec-check the advertisement on air",
+        description="Scan for Apple Offline Finding advertisements, rebuild "
+                    "the public key from address + payload the way a finder "
+                    "does, and check the frame against the spec (paper Tab. "
+                    "2, config.h) and against devices.json. "
+                    "Exit codes: 0 all checks pass; 1 no packet seen; 2 "
+                    "packets seen but none is ours - a reversed address "
+                    "ordering is named explicitly; 3 a spec or key check "
+                    "failed.")
     verify.add_argument("seconds", nargs="?", type=float, default=15.0)
 
     scan = sub.add_parser("scan", parents=[verbose],

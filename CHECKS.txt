@@ -108,13 +108,27 @@ Manual / ad-hoc (open a console session with TB unlock --reset, then):
 --------------------------------------------------------------------------------
 4. BLE BEACON - ADVERTISEMENT CONTENT
 --------------------------------------------------------------------------------
-[ ] TB verify 15     -> PASS, our MAC found, rssi ~-30..-40 dBm in the lab
-[ ] TB scan 15       -> dumps OF packets: mac, rssi, hits, status, 21-byte key
-[ ] advertised key equals KEY? for the current slot (verify does this check)
-[ ] random static address = key[0]|0xC0, key[1..4], (key[5]&0x3f)|0xC0 and
-    BlueZ reports it reversed - scan's "key" matches the KEY? hex
-[ ] frame layout: 1e ff 4c 00 12 19 <status> <21 key bytes> <3 addr hint>
-[ ] status byte bitfield (config.h):
+[x] TB verify 15     -> PASS, 14/14 checks, our MAC found, rssi ~-30..-40 dBm
+    (run 2026-10-02 19:56: slot 153, rssi -39 dBm, status 0x00; exit 0.
+    1 = no packet, 2 = packet seen but not ours / wrong byte order,
+    3 = a spec or key check failed)
+[ ] TB scan 15       -> dumps OF packets: mac, rssi, hits, status, 22-byte key
+[x] advertised key equals the stored key of a recent slot - TB verify
+    rebuilds the key from address + payload the way a finder does and
+    compares it with devices.json (KEY?/sync-ble cover the device side)
+[x] random static address + frame layout - TB verify checks both itself:
+      address = (key[0]|0b11) || key[1..5] in display order (OF paper Tab.
+      2); NimBLE stores it little-endian, so the scan sees the same string as
+      beacon_mac() and findmy's mac_address - verify asserts all three agree
+      so neither helper can drift from the spec while staying consistent
+      with the firmware (this is what the byte-order bug hid behind)
+      top two address bits really are 0b11 (they are overwritten by the
+      firmware, the true bits come back from the payload's high-bits byte)
+      frame: 1e ff 4c 00 12 19 <status> <22 key bytes> <key[0]>>6> <hint>
+      = Apple id 0x4c00 + 27 bytes manufacturer data: mfr[0]=0x12,
+      mfr[1]=0x19, mfr[2]=status, mfr[3:25]=key[6:28], mfr[25]=key[0]>>6,
+      mfr[26]=hint (0x00); a non-zero hint or reserved status bits fail
+[ ] status byte bitfield (config.h) - values, not just "reserved bits clear":
       0x00 locked, normal mode
       0x01 unlocked
       0x02 config mode (unpaired or factory PIN)

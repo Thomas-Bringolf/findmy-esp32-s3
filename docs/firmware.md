@@ -92,12 +92,18 @@ Frame (`adv_data`, 31 bytes, built by `set_adv_data()`):
 | 2…3 | Apple company ID `0x4c 00` (part of `mfg_data`) |
 | 4…5 | `0x12 0x19` (offline finding type + 25-byte length) |
 | 6 | **status byte**: `FM_STATUS_UNLOCKED`/`FM_STATUS_CONFIG` bitfield (`0x02` in config mode, `0x01` unlocked, `0x00` in the field) |
-| 7…27 | the 21 advertising-key bytes |
-| 28…30 | derived from key bytes 0/5 (address hint) |
+| 7…28 | the 22 advertising-key bytes `key[6:28]` |
+| 29 | `key[0] >> 6` — the two bits the address is forced to `0b11` |
+| 30 | hint, `0x00` (this firmware never sets it) |
 
-- Random static address = `key[0]\|0xC0, key[1..4], (key[5]&0x3f)\|0xC0`.
-  BlueZ reports the bytes reversed (`fm_beacon.py` and the verify/sync
-  scripts account for that).
+Payload as seen by a scanner (the 27 bytes of `mfg_data` after the company
+ID): `0x12 0x19 status key[6:28] key[0]>>6 hint`.
+
+- Random static address (OF paper Tab. 2): `(pi[0]|0b11<<6) || pi[1..5]` in
+  display order. NimBLE wants host byte order (little-endian, `ble_hs_id.h`),
+  so `set_addr_from_key()` stores it backwards: `addr[5] = key[0]|0xC0` (the
+  octet BLE validates) … `addr[0] = key[5]`. `key[0]`'s own top bits are
+  re-advertised in the payload as `key[0] >> 6`.
 - `apply_adv_interval()` converts `adv_ms` to 0.625 ms units, clamped to the
   controller's 0x20…0x4000 window.
 - TX power is `ESP_PWR_LVL_P9` (+9 dBm).

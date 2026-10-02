@@ -22,7 +22,7 @@ Scripts/
     pair_device.py, sync_ble.py, verify_beacon.py, test_uart.py,
     measure_power.py, retrieve_rotating.py, retrieve_reports.py,
     monitor.py, scan_findmy.py, fm_beacon.py, retrieve_loop.sh,
-    Makefile, KeyGen/            (kept as reference, not maintained)
+    fetch_once.py, Makefile, KeyGen/    (kept as reference, not maintained)
   state/                 all persistent data (never commit this!)
     devices.json          paired beacons (keys, slot sync, timing, PIN)
     reports.json          incremental archive of location reports
@@ -74,7 +74,7 @@ nothing until it is reset.
 | `retrieve` | fetch location reports (`--bg`/`--status`/`--doctor`/`--follow`/`--stop`) |
 | `watch` | retrieve and keep polling |
 | `monitor` | live dashboard over `reports.json` |
-| `verify` | is our key on air? |
+| `verify` | spec-check the advertisement on air (14 checks) |
 | `scan` | raw BLE scan for Find My packets |
 | `pin` | set a new console PIN |
 | `unlock` / `lock` | leave the console unlocked / locked |
@@ -257,8 +257,31 @@ credential-free until the session expires (delete
 
 `monitor` shows time since the last report (green ≤ 45 min / yellow ≤ 3 h /
 red), the latest reports with slot, age, position and accuracy, and a
-per-slot coverage strip. `verify` matches the advertisement on air against
-every recent slot key of every paired device.
+per-slot coverage strip.
+
+`verify` rebuilds the 28-byte public key from the address *and* the payload
+exactly the way a Find My finder does, matches it against every recent slot
+key of every paired device, then checks the frame itself in two groups:
+
+* **static specification** — Apple id `0x004C`, OF type `0x12`, OF length
+  `0x19`, 27 bytes of manufacturer data, the random-static address really
+  carries `0b11` in its top two bits, the status byte uses only the bits
+  `config.h` defines, the hint byte is `0x00`;
+* **public key against `devices.json`** — payload suffix `key[6:28]`, the
+  high-bits byte `key[0] >> 6`, the rebuilt key equals the stored key,
+  `beacon_mac()` equals the advertised MAC, and `beacon_mac()` equals
+  findmy's own `mac_address` (so the helper can never drift away from the
+  spec while still agreeing with the firmware).
+
+Exit codes: `0` all checks pass, `1` no packet seen, `2` packets seen but
+none is ours — a reversed address ordering is called out by name, `3` a
+spec or key check failed.
+
+For a packet `verify` cannot match, `old/fetch_once.py` asks Apple about
+every candidate key rebuilt from that one capture (both address orders and
+all four `key[5]` top-bit variants) in a single request — a hit names the
+ordering the firmware was really using. That is how the byte-order bug was
+pinned down.
 
 ### pin / unlock / lock
 

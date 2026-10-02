@@ -50,10 +50,10 @@ static bool manual_adv = false;
 static esp_timer_handle_t rotation_timer = NULL;
 static TimerHandle_t adv_log_timer = NULL;
 
-/* BLE random-static identity address (from key[0..5]). This is advertised
- * via the controller, separate from the manufacturer-data payload.
- * Byte 5's top bits are forced to 11 so NimBLE accepts it as a valid
- * random static address (it validates addr[5] & 0xc0 must be 0x00 or 0xc0). */
+/* BLE random-static identity address built from key[0..5]. NimBLE wants host
+ * byte order (little-endian), so beacon_addr[5] is the most significant octet
+ * and gets pi[0] | 0b11 forced into its top bits (BLE's random static rule);
+ * pi[0]'s own top bits travel in the payload as pi[0] >> 6. */
 static uint8_t beacon_addr[6] = { 0, 0, 0, 0, 0, 0 };
 
 #define LOGV(format, ...) \
@@ -139,14 +139,19 @@ static int set_adv_data(void)
     return ble_gap_adv_set_fields(&fields);
 }
 
+/* NimBLE takes the address in host byte order (little-endian), addr[0] is the
+ * least significant octet, so the wire/display order (paper Tab. 2:
+ * (pi[0] | 0b11<<6) || pi[1..5]) has to be stored backwards here. The two
+ * most significant bits that BLE forces to 0b11 are pi[0]'s - they are
+ * re-advertised in the payload as pi[0] >> 6, so nothing is lost. */
 static void set_addr_from_key(uint8_t *addr, uint8_t *public_key)
 {
-    addr[0] = public_key[0] | 0b11000000;
-    addr[1] = public_key[1];
-    addr[2] = public_key[2];
-    addr[3] = public_key[3];
-    addr[4] = public_key[4];
-    addr[5] = (public_key[5] & 0x3f) | 0xC0;   /* valid random static for NimBLE */
+    addr[0] = public_key[5];
+    addr[1] = public_key[4];
+    addr[2] = public_key[3];
+    addr[3] = public_key[2];
+    addr[4] = public_key[1];
+    addr[5] = public_key[0] | 0b11000000;   /* MSB, validated by NimBLE */
 }
 
 static void set_payload_from_key(uint8_t *payload, uint8_t *public_key)
@@ -166,8 +171,17 @@ void ble_adv_publish_frame(void)
 
 void ble_adv_restore_frame(void)
 {
+    static uint8_t public_key[28];
+
     memcpy(adv_data, rtc_state.adv, sizeof(adv_data));
-    memcpy(beacon_addr, rtc_state.addr, 6);
+    /* Never trust the address kept in RTC memory: it may come from a build
+     * that stored the key bytes in a different order. Rebuild it from the
+     * current key so the byte order is always the one on this flash. */
+    if (fm_current_pubkey(public_key) == 0) {
+        set_addr_from_key(beacon_addr, public_key);
+    } else {
+        memcpy(beacon_addr, rtc_state.addr, 6);
+    }
 }
 
 void ble_adv_apply_current_key(void)
@@ -192,7 +206,7 @@ void ble_adv_apply_current_key(void)
                       public_key[16], public_key[17], public_key[18], public_key[19],
                       public_key[20], public_key[21], public_key[22], public_key[23],
                       public_key[24], public_key[25], public_key[26], public_key[27]);
-    LOGV("device address: %02x %02x %02x %02x %02x %02x",
+    LOGV("address (nimble/le order): %02x %02x %02x %02x %02x %02x",
          beacon_addr[0], beacon_addr[1], beacon_addr[2],
          beacon_addr[3], beacon_addr[4], beacon_addr[5]);
     ble_adv_publish_frame();
@@ -404,8 +418,10 @@ void ble_adv_shutdown(void)
     esp_bt_controller_disable();
 }
 
-/* BlueZ/bleak print BLE addresses with the bytes reversed relative to how
- * the firmware stores them (b0..b5 -> b5..b0), so print both orders. */
+/* NimBLE keeps the address in host byte order (least significant octet
+ * first), BlueZ/bleak show it in display order (most significant octet
+ * first), so print both. The display order is the one Apple's OF spec
+ * wants: (pi[0] | 0b11<<6) || pi[1..5]. */
 static void log_beacon_mac(void)
 {
     static uint8_t last[6] = {0};
@@ -418,12 +434,12 @@ static void log_beacon_mac(void)
     logged = true;
 
     ESP_LOGI(LOG_TAG,
-             "adv mac addr: %02x:%02x:%02x:%02x:%02x:%02x (bluez: "
-             "%02x:%02x:%02x:%02x:%02x:%02x)",
-             beacon_addr[0], beacon_addr[1], beacon_addr[2],
-             beacon_addr[3], beacon_addr[4], beacon_addr[5],
+             "adv mac addr (display): %02x:%02x:%02x:%02x:%02x:%02x (nimble "
+             "order: %02x:%02x:%02x:%02x:%02x:%02x)",
              beacon_addr[5], beacon_addr[4], beacon_addr[3],
-             beacon_addr[2], beacon_addr[1], beacon_addr[0]);
+             beacon_addr[2], beacon_addr[1], beacon_addr[0],
+             beacon_addr[0], beacon_addr[1], beacon_addr[2],
+             beacon_addr[3], beacon_addr[4], beacon_addr[5]);
 }
 
 void ble_adv_start_chain(void)
