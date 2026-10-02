@@ -178,8 +178,8 @@ cd Scripts
 | `devices` | list paired beacons |
 | `test` | hardware-in-the-loop protocol suite (resets the device) |
 | `power` | awake/sleep duty cycle from the `PWR` telemetry |
-| `retrieve` | fetch location reports (`--bg` / `--status` / `--doctor` / `--follow` / `--stop`) |
-| `watch` / `monitor` | polling loop / live dashboard |
+| `retrieve` | fetch location reports (`--bg` / `--status` / `--doctor` / `--follow` / `--stop` / `--restart`) |
+| `watch` / `monitor` | tail the retrieval worker / live dashboard |
 | `verify` / `scan` | is our key on air? / raw Find&nbsp;My packet dump |
 | `pin` / `unlock` / `lock` | console PIN management |
 | `wipe` | factory reset: erase keys + PIN and unpair the device |
@@ -243,9 +243,9 @@ holds an `flock` so only one instance ever runs.
 | `sync` / `sync-ble` / `verify` / `scan` | ✅ slot matched from the advertisement |
 | `power --seconds 45` | ✅ 0.37&nbsp;% awake, 23 cycles |
 | `retrieve` (+ `--bg`/`--status`/`--doctor`/`--follow`/`--stop`) | ✅ session restored, worker guarded, gap-safe window |
-| `connect` / `disconnect` / `reset` / menu | ✅ name lookup, PIN trial, state-driven menu |
+| `connect` / `disconnect` / `reset` / menu | ✅ name lookup, PIN trial, grouped menu + worker lifecycle |
 | `apple-id connect` / `disconnect` | ✅ session saved and deleted again |
-| `monitor` / `watch` / `log` | ✅ |
+| `monitor` / `watch` / `log` | ✅ window frame, progress bars, worker log tail |
 
 The complete, runnable list — including the regressions that were found and
 fixed — is in **[CHECKS.txt](CHECKS.txt)**.

@@ -71,8 +71,8 @@ nothing until it is reset.
 | `devices` | list paired devices |
 | `test` | console protocol edge cases (resets the device) |
 | `power` | awake/sleep duty cycle from the `PWR` telemetry |
-| `retrieve` | fetch location reports (`--bg`/`--status`/`--doctor`/`--follow`/`--stop`) |
-| `watch` | retrieve and keep polling |
+| `retrieve` | fetch location reports (`--bg`/`--status`/`--doctor`/`--follow`/`--stop`/`--restart`) |
+| `watch` | start the retrieval worker if needed, then follow its log |
 | `monitor` | live dashboard over `reports.json` |
 | `verify` | spec-check the advertisement on air (14 checks) |
 | `scan` | raw BLE scan for Find My packets |
@@ -96,12 +96,21 @@ so it must be 1…16 characters of `[A-Za-z0-9_-]`), then rotates the PIN to
 a fresh random 8-digit one (`--new-pin` to choose) and stores everything in
 `state/devices.json`.
 
+On a terminal the three timings are asked for before the device is touched;
+just pressing Enter keeps the value shown in brackets, which are the same
+defaults the firmware uses (`adv_ms=2000`, `rot_sec=120`, `dbg_sec=600`).
+Passing the flag skips that question, and `--yes` or a non-interactive run
+takes every default without asking.
+
 | Argument | Meaning |
 |---|---|
 | `--port PATH` | serial device (default `/dev/ttyACM0`) |
 | `--id NAME` | device id in `devices.json` (default `esp32-s3-test`) |
 | `--pin PIN` | PIN used to unlock the device |
 | `--new-pin PIN` | PIN to set after pairing (default: random) |
+| `--adv-ms MS` | advertisement period, 200…60000 ms (prompted) |
+| `--rot-sec S` | key rotation period, 1…86400 s (prompted) |
+| `--dbg-sec S` | console countdown, 60…3600 s or 0 = never (prompted) |
 | `--force` | overwrite an existing device id (asks to type `pair` on a TTY) |
 | `--yes` / `-y` | no confirmation for `--force` |
 | `--debug 0/1` | device debug flag right after pairing |
@@ -216,8 +225,17 @@ reports medians, min/max and the awake duty cycle (see
 ./findmy-toolbox.py retrieve --doctor       # do known reports still come back?
 ./findmy-toolbox.py retrieve --follow       # tail its log
 ./findmy-toolbox.py retrieve --stop         # stop it
-./findmy-toolbox.py watch --interval 120    # foreground polling
+./findmy-toolbox.py retrieve --restart      # stop it, then start it again
+./findmy-toolbox.py watch                   # start it if needed, then tail it
+./findmy-toolbox.py watch --lines 80        # how many log lines before the tail
 ```
+
+`watch` does not poll on its own any more: it follows whatever the
+background worker writes to `state/toolbox.log`, so the foreground and the
+background show the same thing. It starts the worker if there is none (and
+refuses when there is no saved Apple session, since such a worker could not
+fetch anything — run `retrieve` once to log in). Ctrl-C only ends the tail,
+the worker keeps running.
 
 Incremental fetch for every beacon in `devices.json`: one request per slot
 (Apple caps batched responses), starting at the newest slot that already has
@@ -229,6 +247,19 @@ If the worker was down it does **not** silently skip the slots nobody
 queried: it remembers the highest slot it reached and resumes there (capped
 at 720 slots / 24 h), so a laptop that slept through the night still catches
 the reports uploaded during that gap.
+
+Before the first fetch of a run the archive is also used to check the
+stored slot alignment. A report's `time` is when a finder recorded the
+beacon, so it pins down the moment the device broadcast the key stored as
+that report's `slot` label, while the clock model in `state/devices.json`
+claims a slot for the same moment — the two only differ once the model has
+drifted away from the device counter, and then by the same offset for every
+report. When at least 3 archived reports over at least 2 slots agree on one
+offset, the alignment is rewritten on the spot (`sync_method: "report"`)
+and the fetch runs against the corrected model; weaker or conflicting
+evidence only logs a warning, and reports older than the last sync are
+ignored because they may belong to an earlier pairing. `sync` (USB) and
+`sync-ble` are the explicit versions of the same correction.
 
 `--doctor` is the positive control for "is my Apple ID banned?": it re-asks
 Apple for keys we already hold reports for. Those reports are fresh enough
@@ -255,9 +286,19 @@ credential-free until the session expires (delete
 ./findmy-toolbox.py scan 15                     # raw OF packet dump
 ```
 
-`monitor` shows time since the last report (green ≤ 45 min / yellow ≤ 3 h /
-red), the latest reports with slot, age, position and accuracy, and a
-per-slot coverage strip.
+`monitor` shows the accessory status byte of the newest report — `0x00
+(locked+sleep-cycle)` green, `UNLOCKED` yellow, `CONFIG` red — then time
+since the last report (green ≤ 45 min / yellow ≤ 3 h / red), the latest
+reports with slot, age, position and accuracy, and a per-slot coverage
+strip. The screen is one window frame: title in the top border, the worker
+state, device count and clock on the right of it, the key hints in the
+bottom border. The freshness line carries a progress bar filled relative to
+the 3 h warning threshold, with the percentage next to it. Every fetched
+report archives that byte as `status` plus a decoded
+`status_text`, and the retriever summarises the newest one per device under
+`status` in `state/reports.json`. Only devices that are in
+`state/devices.json` are listed: archive entries left over from wiped
+devices are collapsed into a single "hidden" count line.
 
 `verify` rebuilds the 28-byte public key from the address *and* the payload
 exactly the way a Find My finder does, matches it against every recent slot
@@ -353,28 +394,50 @@ secrets redacted (keys, passwords, PINs).
 ./findmy-toolbox.py          # no arguments: numbered menu, prompt-driven
 ```
 
-The menu is driven by the current state. The status block at the top always
-shows the two connections:
+The menu is one window: the title in the top border, the worker state and
+the clock on its right, the key hints in the bottom border. The status
+block at the top always shows the two connections and the archive:
 
 ```
 console : connected to 'esp32-s3-test' on /dev/ttyACM0 (paired)
 apple   : connected as you@example.com
+devices : 1 (esp32-s3-test)
+reports : 42, newest 2min ago  ▏░░░░░░░░░░░░░░░░░
+worker  : running (pid 195776)
+log     : state/toolbox.log
 ```
 
-and the entries change with them:
+Every entry is always listed, grouped by type and coloured by group:
 
-* **no console connected** → only the commands that do not need UART
-  (`devices`, `sync-ble`, `retrieve`, `doctor`, `watch`, `monitor`, `verify`,
-  `scan`, `log`, `help`), plus `connect` and `reset`, plus `apple connect`;
-* **connected** → the console commands appear (`sync`, `test`, `power`,
-  `pin`, `pair`, `wipe`, `disconnect`, `reset`), each already bound to the
-  connected device's `--id`/`--port`;
-* **Apple ID saved** → the entry flips to `apple disconnect`.
+| group | colour | entries |
+|---|---|---|
+| `MONITORING` | cyan | `devices`, `retrieve`, `doctor`, `watch`, `restart`, `monitor`, `log` |
+| `RADIO (BLE)` | blue | `verify`, `scan`, `sync-ble` |
+| `CONSOLE (UART)` | green | `connect`, `disconnect`, `reset`, `sync`, `unlock`, `lock` |
+| `PROVISIONING` | yellow | `pair`, `pin`, `wipe` |
+| `DEBUG` | magenta | `test`, `power` |
+| `APPLE ID` | white | `apple connect`, `apple status`, `apple disconnect` |
+| `SYSTEM` | white | `help` |
+
+Entries that cannot run right now stay visible and greyed out, with the
+reason at the right of the line (for the long ones the reason takes the
+place of the description): `needs
+'connect'` for the UART ones until `connect` identified a beacon (then they
+are pre-filled with that device's `--id`/`--port`), `no saved Apple session`
+for `apple disconnect`, `logged in as …` for `apple connect`. Picking one
+tells you why and returns to the menu.
+
+The retrieval worker belongs to the menu: it is started when the menu opens
+(only if there is a saved Apple session and no worker already running) and
+stopped again when the menu closes, so no worker outlives the console.
+`restart` (menu entry for `retrieve --restart`) stops and starts it while
+you watch, `watch` shows its log, and the status block says which state it
+is in.
 
 Pick a number, or type a command name by hand. `connect` sets the
 connection, `disconnect` and `wipe` clear it (a wiped beacon has to be
-identified and paired again). `-v`/`--verbose` is a CLI option (before or
-after the command).
+identified and paired again). An empty line just refreshes the screen.
+`-v`/`--verbose` is a CLI option (before or after the command).
 
 ## Dependencies
 

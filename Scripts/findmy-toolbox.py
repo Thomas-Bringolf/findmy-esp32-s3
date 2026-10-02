@@ -67,12 +67,14 @@ LOCK_FILE = STATE_DIR / "retrieve.lock"
 DEFAULT_PORT = "/dev/ttyACM0"
 DEFAULT_ID = "esp32-s3-test"
 DEFAULT_PIN = "00000000"
-DEFAULT_WATCH = 120
 DEFAULT_SCAN_SECS = 15
 DEFAULT_SECS = 60
 DEFAULT_DEVICE = ""
 MAX_BACKTRACK_SLOTS = 30
 MAX_WINDOW_SLOTS = 720       # never look further back than this (24 h of slots)
+AUTOSYNC_MIN_REPORTS = 3
+AUTOSYNC_MIN_SLOTS = 2
+AUTOSYNC_MAX_DRIFT = MAX_BACKTRACK_SLOTS
 RETRIEVE_SLEEP_S = 90
 PIN_LEN = 8
 PIN_FAIL_MAX = 5           # firmware FM_PIN_FAIL_MAX (before a lockout)
@@ -101,6 +103,8 @@ WHITE = "\033[97m"
 FRESH_OK = 45 * 60
 FRESH_WARN = 3 * 3600
 BAR_CHARS = " ▁▂▃▄▅▆▇█"
+UI_WIDTH = 74
+MENU_COLS = UI_WIDTH - 4
 
 CHANNEL_COLOR = {
     "MAIN": WHITE, "UI": CYAN, "PAIR": GREEN, "SYNC": BLUE,
@@ -117,6 +121,89 @@ def paint(color: str, text: str, ui: bool = False) -> str:
     if not (UI_COLOR if ui else LOG_COLOR):
         return text
     return f"{color}{text}{RESET}"
+
+
+ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+BAR_PARTS = "▏▎▍▌▋▊▉"
+
+
+def text_width(text: str) -> int:
+    """Columns of a string that may carry ANSI colour codes."""
+    return len(ANSI_RE.sub("", text))
+
+
+def pad_right(text: str, width: int) -> str:
+    return text + " " * max(0, width - text_width(text))
+
+
+def truncate(text: str, width: int) -> str:
+    """Cut a possibly coloured string to `width` columns, keeping its codes."""
+    out: list[str] = []
+    seen = 0
+    coloured = False
+    i = 0
+    while i < len(text):
+        code = ANSI_RE.match(text, i)
+        if code:
+            out.append(code.group(0))
+            coloured = True
+            i = code.end()
+            continue
+        if seen >= width:
+            if coloured:
+                out.append(RESET)
+            return "".join(out)
+        out.append(text[i])
+        seen += 1
+        i += 1
+    return text
+
+
+def ui_bar(fraction: float, width: int = 20, color: str = GREEN,
+           track: str = "░") -> str:
+    """Progress bar: whole blocks, then a partial block, then the track."""
+    fraction = max(0.0, min(1.0, float(fraction)))
+    filled = fraction * width
+    full = int(filled)
+    part = ""
+    if full < width:
+        cell = int((filled - full) * len(BAR_PARTS))
+        if cell:
+            part = BAR_PARTS[cell]
+    bar = paint(color, "█" * full + part, ui=True)
+    return bar + paint(DIM, track * (width - full - len(part)), ui=True)
+
+
+def ui_edge(left: str, right: str, label: str = "", right_label: str = "",
+            core: int = 72) -> str:
+    """One horizontal window border: label on the left, right_label on the
+    right, dashes filling whatever is left."""
+    head = f"─ {label} " if label else ""
+    tail = f" {right_label} ─" if right_label else ""
+    fill = core - text_width(head) - text_width(tail)
+    if fill < 1:
+        tail = ""
+        fill = core - text_width(head)
+    if fill < 1:
+        head, fill = "", core
+    return left + head + "─" * fill + tail + right
+
+
+def ui_frame(title: str, body: list[str], *, right_label: str = "",
+             footer: str = "", width: int = UI_WIDTH,
+             color: str = CYAN) -> list[str]:
+    """A window around `body`: title border on top, footer border below."""
+    core = width - 2
+    def edge(left: str, right: str, label: str, right_label: str) -> str:
+        return paint(color + BOLD,
+                     ui_edge(left, right, label, right_label, core), ui=True)
+    bar = paint(color + BOLD, "│", ui=True)
+    out = [edge("╭", "╮", title, right_label)]
+    for line in body:
+        out.append(bar + pad_right(" " + truncate(line, core - 2), core - 1)
+                   + " " + bar)
+    out.append(edge("╰", "╯", footer, ""))
+    return out
 
 
 def ui(text: str, color: str = "") -> None:
@@ -234,6 +321,27 @@ def prompt_valid_pin(label: str, default: str | None = None) -> str:
         if valid_pin(raw):
             return raw
         print(paint(RED, f"  {PIN_LEN} digits, please", ui=True))
+
+
+def prompt_int(label: str, default: int, lo: int, hi: int,
+               also: tuple[int, ...] = ()) -> int:
+    """Ask for an integer in lo..hi (plus any extra values accepted).
+
+    An empty line keeps the default, and a non-terminal stdin returns the
+    default without asking, so scripts and pipes behave like before.
+    """
+    hint = f"{lo}..{hi}" + (f" or {'/'.join(str(v) for v in also)}"
+                            if also else "")
+    while True:
+        raw = prompt(label, str(default))
+        try:
+            value = int(raw)
+        except ValueError:
+            print(paint(RED, f"  a whole number ({hint}), please", ui=True))
+            continue
+        if lo <= value <= hi or value in also:
+            return value
+        print(paint(RED, f"  {hint}, please", ui=True))
 
 
 def load_devices() -> dict:
@@ -535,6 +643,37 @@ def status_decode(status_byte: int) -> str:
     return f"0x{status_byte:02x} ({'+'.join(bits)})"
 
 
+def status_color(status_byte: int | None) -> str:
+    """Green = normal field state, yellow = console open, red = config mode."""
+    if status_byte is None:
+        return DIM
+    if status_byte & 0x02:
+        return RED
+    if status_byte & 0x01:
+        return YELLOW
+    return GREEN
+
+
+def report_status(d: dict) -> tuple[int | None, str]:
+    """(status byte, decoded text) of an archived report record."""
+    raw = d.get("status")
+    if not isinstance(raw, int):
+        return None, ""
+    return raw, d.get("status_text") or status_decode(raw)
+
+
+def status_summary(reports: list[dict]) -> dict | None:
+    """Newest advertisement status in an archive, for reports.json."""
+    known = [r for r in reports if isinstance(r.get("status"), int)
+             and r.get("time")]
+    if not known:
+        return None
+    newest = max(known, key=lambda r: r["time"])
+    raw, text = report_status(newest)
+    return {"status": raw, "text": text, "slot": newest.get("slot"),
+            "time": newest["time"]}
+
+
 def fmt_age(seconds: float) -> str:
     s = int(max(0, seconds))
     if s < 60:
@@ -824,12 +963,26 @@ def cmd_pair(args) -> int:
 
     port = resolve_port(args.port, existing)
     pin = unlock_pin_for(existing, args.pin)
-    adv_ms = args.adv_ms or 2000
-    rot_sec = args.rot_sec or 120
-    dbg_sec = args.dbg_sec if args.dbg_sec is not None else 600
     if not valid_name(dev_id):
         raise UserError(f"--id must be a device name: 1..{NAME_LEN} "
                         f"characters from [A-Za-z0-9_-], got '{dev_id}'")
+
+    ask = sys.stdin.isatty() and not args.yes
+    if args.adv_ms:
+        adv_ms = args.adv_ms
+    else:
+        adv_ms = (prompt_int("advertisement period in ms", 2000, 200, 60000)
+                  if ask else 2000)
+    if args.rot_sec:
+        rot_sec = args.rot_sec
+    else:
+        rot_sec = (prompt_int("key rotation period in s", 120, 1, 86400)
+                   if ask else 120)
+    if args.dbg_sec is not None:
+        dbg_sec = args.dbg_sec
+    else:
+        dbg_sec = (prompt_int("console countdown in s", 600, 60, 3600, (0,))
+                   if ask else 600)
 
     # From a connection the console stays open (the menu keeps working on
     # it); a plain CLI run locks the device again when it is done.
@@ -1077,8 +1230,12 @@ class Suite:
 
     def summary(self) -> int:
         failed = self.failed
+        total = len(self.results)
+        passed = total - len(failed)
         ui("")
-        ui(f"{len(self.results) - len(failed)}/{len(self.results)} checks passed",
+        ui(f"{passed}/{total} checks passed  "
+           + ui_bar(passed / total if total else 0.0, 24,
+                    GREEN if not failed else YELLOW),
            GREEN + BOLD if not failed else RED + BOLD)
         for name in failed:
             ui(f"  FAILED: {name}", RED)
@@ -1540,7 +1697,9 @@ def cmd_power(args) -> int:
        f"min {min(awake) / 1000:.2f} ms  max {max(awake) / 1000:.2f} ms")
     ui(f"sleep  median   : {med_s / 1e6:.3f} s")
     ui(f"cycle  median   : {(med_a + med_s) / 1e6:.3f} s")
-    ui(f"awake duty      : {duty * 100:.2f} %", GREEN)
+    ui(f"awake duty      : {duty * 100:.2f} %  "
+       + ui_bar(min(1.0, duty / 0.05), 24, GREEN)
+       + paint(DIM, "   0..5% full-scale", ui=True), GREEN)
 
     avg_ma = None
     if args.ma_awake is not None and args.ma_sleep is not None:
@@ -1594,6 +1753,7 @@ def report_to_dict(r, slot: int, key) -> dict:
         "accuracy_m": r.horizontal_accuracy,
         "confidence": r.confidence,
         "status": r.status,
+        "status_text": status_decode(r.status),
         "key_hash": key.hashed_adv_key_b64,
     }
 
@@ -1663,12 +1823,14 @@ async def fetch_new_reports(account, acc, dev_id: str, results: dict,
         if raw:
             log(channel, f"{dev_id}: slot {slot}: {len(raw)} report(s) on "
                          f"server, {added} new")
-        state["last_fetched_slot"] = slot
+        prev = state.get("last_fetched_slot")
+        state["last_fetched_slot"] = slot if prev is None else max(prev, slot)
         save_results(results)
         await asyncio.sleep(0.2)
 
     state["fetched_upto"] = min(failed) if failed else max_i
     state["reports"].sort(key=lambda d: d["time"])
+    state["status"] = status_summary(state["reports"])
     save_results(results)
     return fresh
 
@@ -1827,6 +1989,120 @@ def print_new_report(dev_id: str, d: dict) -> None:
     ui(f"    Longitude:  {d['longitude']}")
     ui(f"    Accuracy:   {d['accuracy_m']} m")
     ui(f"    Confidence: {d['confidence']}")
+    _raw, status_text = report_status(d)
+    if status_text:
+        ui(f"    Status:     {status_text}")
+
+
+def model_slot_index(dev: dict, when: datetime) -> int:
+    """Chain index the clock model in devices.json gives to a moment.
+
+    The same rule findmy's `get_max_index` uses, which is what every query
+    window is built from.
+    """
+    if dev.get("slot_synced_at") and dev.get("last_known_slot") is not None:
+        aligned_at = parse_time(dev["slot_synced_at"])
+        aligned_index = int(dev["last_known_slot"])
+    else:
+        aligned_at = parse_time(dev["paired_at"])
+        aligned_index = 0
+    if when <= aligned_at:
+        return aligned_index
+    ss = int(dev.get("slot_seconds", 120))
+    return aligned_index + int((when - aligned_at) // timedelta(seconds=ss))
+
+
+def auto_slot_sync(devices: list[dict], results: dict, channel: str) -> int:
+    """Fix a device's stored slot alignment from its own archived reports.
+
+    A report's `time` is when a finder recorded the beacon, so it is ground
+    truth for the moment the device advertised the key stored as the report's
+    `slot` label, while the clock model claims a chain index for that same
+    moment. The two only differ when the model has drifted away from the
+    device counter, and then by the same offset for every report. The stored
+    alignment is rewritten (`sync_method: "report"`) once enough reports over
+    enough slots agree on that offset; anything weaker is only warned about.
+
+    Device entries are mutated in place - the caller saves them. Returns the
+    number of devices corrected.
+    """
+    now = datetime.now(timezone.utc)
+    corrected = 0
+    for dev in devices:
+        dev_id = dev.get("id", "?")
+        state = results.get(dev_id)
+        if not isinstance(state, dict):
+            continue
+        reports = state.get("reports")
+        if not isinstance(reports, list):
+            continue
+        if len(reports) < AUTOSYNC_MIN_REPORTS:
+            continue
+        try:
+            aligned_at = (parse_time(dev["slot_synced_at"])
+                          if dev.get("slot_synced_at")
+                          else parse_time(dev["paired_at"]))
+        except (KeyError, TypeError, ValueError):
+            log(channel, f"{dev_id}: no usable alignment time - auto sync "
+                         f"skipped", logging.WARNING)
+            continue
+
+        votes: dict[int, list[int]] = {}
+        too_far = 0
+        for r in reports:
+            if not isinstance(r, dict):
+                continue
+            if r.get("type", "primary") != "primary":
+                continue
+            stamp = report_time(r)
+            label = r.get("slot")
+            if stamp is None or not isinstance(label, int):
+                continue
+            if stamp < aligned_at:
+                continue
+            delta = model_slot_index(dev, stamp) - label
+            if abs(delta) > AUTOSYNC_MAX_DRIFT:
+                too_far += 1
+                continue
+            votes.setdefault(delta, []).append(label)
+
+        if too_far:
+            log(channel, f"{dev_id}: {too_far} archived report(s) sit more "
+                         f"than {AUTOSYNC_MAX_DRIFT} slot(s) from the slot "
+                         f"model - run 'sync' or 'sync-ble'", logging.WARNING)
+        if not votes:
+            continue
+        total = sum(len(v) for v in votes.values())
+        delta, hits = max(votes.items(), key=lambda kv: len(kv[1]))
+        slots = set(hits)
+        if delta == 0:
+            continue
+        if (len(hits) < AUTOSYNC_MIN_REPORTS or len(slots) < AUTOSYNC_MIN_SLOTS
+                or len(hits) * 2 <= total):
+            log(channel, f"{dev_id}: slot model is {delta:+d} in {len(hits)}/"
+                         f"{total} archived report(s) over {len(slots)} "
+                         f"slot(s) - too little agreement to correct it",
+                logging.WARNING)
+            continue
+        current = model_slot_index(dev, now)
+        target = current - delta
+        if target < 0:
+            log(channel, f"{dev_id}: auto sync would move slot {current} "
+                         f"back by {delta} below zero - ignored",
+                logging.WARNING)
+            continue
+        dev["slot_synced_at"] = now.isoformat()
+        dev["last_known_slot"] = target
+        dev["sync_method"] = "report"
+        corrected += 1
+        where = "behind" if delta > 0 else "ahead of"
+        log(channel, f"{dev_id}: auto slot sync - device counter {abs(delta)} "
+                     f"slot(s) {where} the clock model ({len(hits)} report(s) "
+                     f"over {len(slots)} slot(s)), slot {current} -> {target}",
+            logging.WARNING)
+        ui(f"'{dev_id}': auto slot sync {delta:+d} - now at slot {target}",
+           YELLOW)
+    return corrected
 
 
 async def retrieve_run(apple_id: str | None, dev_filter: str | None,
@@ -1843,6 +2119,10 @@ async def retrieve_run(apple_id: str | None, dev_filter: str | None,
         log_error(channel, f"no devices in {DEVICES_JSON.name} - run 'pair' first")
         return 1
 
+    results = load_results()
+    if auto_slot_sync(devices, results, channel):
+        save_devices(data)
+
     accessories = {d["id"]: make_accessory(d) for d in devices}
     for dev_id, acc in accessories.items():
         log(channel, f"'{dev_id}': paired {acc.paired_at}, "
@@ -1853,7 +2133,6 @@ async def retrieve_run(apple_id: str | None, dev_filter: str | None,
     if account is None:
         return 1
 
-    results = load_results()
     try:
         attempt = 0
         while True:
@@ -1925,13 +2204,14 @@ def retrieve_running_info() -> dict | None:
         probe.close()
 
 
-def retrieve_start_bg() -> int:
+def retrieve_start_bg(quiet: bool = False) -> int:
     channel = "WORKER"
     STATE_DIR.mkdir(exist_ok=True)
     existing = retrieve_running_info()
     if existing:
         log(channel, f"retrieval worker already running (pid {existing['pid']})")
-        ui(f"already running (pid {existing['pid']})")
+        if not quiet:
+            ui(f"already running (pid {existing['pid']})")
         return 1
 
     handle = LOCK_FILE.open("a+")
@@ -1955,8 +2235,11 @@ def retrieve_start_bg() -> int:
         except (OSError, json.JSONDecodeError):
             pass
         log(channel, f"retrieval worker started in the background (pid {worker})")
-        ui(f"retrieval worker started (pid {worker}), logs in {LOG_FILE.name}")
-        ui("  use 'retrieve --status', 'retrieve --follow' or 'retrieve --stop'")
+        if not quiet:
+            ui(f"retrieval worker started (pid {worker}), "
+               f"logs in {LOG_FILE.name}")
+            ui("  use 'retrieve --status', 'retrieve --follow' "
+               "or 'retrieve --stop'")
         return 0
 
     os.setsid()
@@ -2049,7 +2332,8 @@ def retrieve_stop() -> int:
     return 0
 
 
-def retrieve_follow(lines: int = 50, filtered: bool = True) -> int:
+def retrieve_follow(lines: int = 50, filtered: bool = True,
+                    device: str | None = None) -> int:
     channel = "RETRIEVE"
     if not LOG_FILE.exists():
         log_error(channel, f"{LOG_FILE} does not exist yet")
@@ -2058,13 +2342,16 @@ def retrieve_follow(lines: int = 50, filtered: bool = True) -> int:
     def keep(line: str) -> bool:
         if not filtered:
             return True
-        return "[RETRIEVE" in line or "[WORKER " in line
+        if "[RETRIEVE" not in line and "[WORKER " not in line:
+            return False
+        return not device or device in line
 
     content = LOG_FILE.read_text(errors="replace").splitlines()
-    for line in [l for l in content if keep(l)][-lines:]:
+    shown = [l for l in content if keep(l)][-lines:]
+    for line in shown:
         print(line, flush=True)
-    print(paint(DIM, f"following {LOG_FILE.name} - Ctrl-C to stop", ui=True),
-          flush=True)
+    print(paint(DIM, f"following {LOG_FILE.name} ({len(shown)} line(s), "
+                     "Ctrl-C to stop)", ui=True), flush=True)
     size = LOG_FILE.stat().st_size
     try:
         while True:
@@ -2092,8 +2379,13 @@ def cmd_retrieve(args) -> int:
         return retrieve_status()
     if args.stop:
         return retrieve_stop()
+    if args.restart:
+        rc = retrieve_stop()
+        if rc:
+            return rc
+        return retrieve_start_bg()
     if args.follow:
-        return retrieve_follow(args.lines)
+        return retrieve_follow(args.lines, device=args.device)
     if args.bg:
         return retrieve_start_bg()
     if args.doctor:
@@ -2112,14 +2404,23 @@ def cmd_retrieve(args) -> int:
 
 def cmd_watch(args) -> int:
     channel = "RETRIEVE"
-    interval = args.interval or DEFAULT_WATCH
-    log(channel, f"watching for reports every {interval}s")
-    try:
-        return asyncio.run(retrieve_run(None, args.device, interval,
-                                        MAX_BACKTRACK_SLOTS, channel=channel))
-    except KeyboardInterrupt:
-        log(channel, "stopped")
-        return 130
+    info = retrieve_running_info()
+    if not info or not info["alive"]:
+        if not session_account_name():
+            log_error(channel, "no saved Apple session - run 'retrieve' once "
+                               "to log in, then 'watch' again")
+            return 1
+        log(channel, "watch: no retrieval worker, starting one")
+        ui("starting the retrieval worker ...")
+        if retrieve_start_bg(quiet=True) != 0:
+            info = retrieve_running_info()
+            if not info or not info["alive"]:
+                log_error(channel, "could not start the retrieval worker")
+                return 1
+    log(channel, f"watch: following the worker log "
+                 f"(last {args.lines} line(s))")
+    ui("following the retrieval worker - Ctrl-C to stop", DIM)
+    return retrieve_follow(args.lines, filtered=True, device=args.device)
 
 
 def render_monitor(device_id: str | None) -> str:
@@ -2128,24 +2429,22 @@ def render_monitor(device_id: str | None) -> str:
     results = load_json(REPORTS_JSON)
     p = lambda color, text: paint(color, text, ui=True)
 
-    if not results:
-        body = p(DIM, "no archive yet - run 'findmy-toolbox.py retrieve' first")
-        ids = []
-    else:
-        ids = [device_id] if device_id and device_id in results else list(results)
-        if device_id and device_id not in results:
-            body = p(RED, f"device '{device_id}' not in reports.json")
+    ids = list(devices)
+    body = None
+    if not devices:
+        body = p(DIM, "no devices - run 'findmy-toolbox.py pair' first")
+    elif device_id:
+        if device_id in devices:
+            ids = [device_id]
+        else:
+            body = p(RED, f"device '{device_id}' is not in {DEVICES_JSON.name}"
+                          f" - run 'pair' first")
             ids = []
+    hidden = sorted(k for k in results if k not in devices)
 
     out = []
-    width = 74
-    out.append(p(CYAN + BOLD, f"╔{'═' * (width - 2)}╗"))
-    title = " ESP32 FIND MY - BEACON MONITOR "
-    out.append(p(CYAN + BOLD, f"║{title}{' ' * (width - 2 - len(title))}║"))
-    out.append(p(CYAN + BOLD, f"╚{'═' * (width - 2)}╝"))
-
     for i, dev_id in enumerate(ids):
-        state = results[dev_id]
+        state = results.get(dev_id, {})
         reports = state.get("reports", [])
         dev = devices.get(dev_id, {})
         if i:
@@ -2153,6 +2452,20 @@ def render_monitor(device_id: str | None) -> str:
         out.append(p(WHITE + BOLD, f"▍ {dev_id}") + "  " +
                    p(DIM, f"slots: {dev.get('slot_seconds', '?')}s  "
                           f"paired: {dev.get('paired_at', '?')}"))
+        st = state.get("status") or status_summary(reports)
+        if st:
+            age_str = "?"
+            if st.get("time"):
+                try:
+                    age_str = fmt_age((now - parse_time(st["time"])
+                                       ).total_seconds())
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            out.append("  " + p(BOLD, "STATUS") + "  " +
+                       p(status_color(st.get("status")) + BOLD,
+                         st.get("text") or "?") + "  " +
+                       p(DIM, f"slot {st.get('slot', '?')}, "
+                              f"report {age_str} ago"))
         if not reports:
             out.append("  " + p(DIM, "no reports yet"))
             continue
@@ -2170,9 +2483,9 @@ def render_monitor(device_id: str | None) -> str:
                    "  " + p(DIM, f"(report from "
                                  f"{newest.astimezone().strftime('%H:%M:%S')}, "
                                  f"slot {max(r['slot'] for r in usable)})"))
-        bar_w = 40
-        filled = int(bar_w * min(1.0, age / FRESH_WARN))
-        out.append("  " + p(col, "█" * filled + "░" * (bar_w - filled)))
+        pct = f"{min(100.0, age / FRESH_WARN * 100):.0f}%"
+        out.append("  " + ui_bar(age / FRESH_WARN, 44, col)
+                   + " " + p(col, pct))
 
         out.append("  " + p(MAGENTA + BOLD, "── latest reports " + "─" * 36))
         out.append("  " + p(DIM, f"{'slot':>5}  {'time (local)':<8}  {'age':>8}  "
@@ -2208,11 +2521,23 @@ def render_monitor(device_id: str | None) -> str:
                                  f"data, last fetched slot "
                                  f"{state.get('last_fetched_slot', '?')}"))
 
-    if not ids and "body" in locals():
+    if body and not ids:
         out.append(body)
-    out.append("")
-    out.append(p(DIM, "refreshing every few seconds - Ctrl-C to quit"))
-    return "\n".join(out)
+    if hidden and ids:
+        out.append(p(DIM, f"{len(hidden)} archived device(s) hidden - not in "
+                          f"{DEVICES_JSON.name}"))
+    right: list[str] = []
+    worker = retrieve_running_info()
+    right.append(p(GREEN, "● worker") if worker and worker["alive"]
+                 else p(DIM, "○ worker"))
+    right.append(f"{len(ids)} device(s)")
+    if hidden:
+        right.append(f"{len(hidden)} archived")
+    right.append(datetime.now().astimezone().strftime("%H:%M:%S"))
+    return "\n".join(ui_frame("ESP32 FIND MY · BEACON MONITOR", out,
+                              right_label="   ".join(right),
+                              footer="refresh every few seconds - Ctrl-C to "
+                                     "quit"))
 
 
 def current_slot(dev: dict) -> int:
@@ -2793,11 +3118,11 @@ def connect_uart(*, port: str | None = None, dev_id: str | None = None,
         if prompt(f"pair '{name}' now?", "y").lower() in ("y", "yes"):
             pair_args = build_parser().parse_args(
                 ["pair", "--id", name, "--port", chosen_port, "--reset"])
-            pair_args.yes = True       # "pair now?" was already answered
             if pin:
                 pair_args.pin = pin
             if find_device(load_devices(), name) is not None:
                 pair_args.force = True
+                pair_args.yes = True       # "pair now?" answered the confirm
             if COMMANDS["pair"](pair_args) == 0:
                 conn = CONNECTED or conn
                 conn.update({"paired": True, "name": name,
@@ -3061,8 +3386,9 @@ findmy-toolbox.py - everything for the ESP32-S3 Find My beacon
                --status   is the worker running?
                --follow   tail the retrieval log
                --stop     stop the background worker
+               --restart  stop the worker, then start it again
                --doctor   do known reports still come back?
-  watch      retrieve and keep polling (default every 120 s)
+  watch      follow the retrieval worker's log (starts one if needed)
   monitor    live dashboard (Ctrl-C to quit)
   verify     spec-check the advertisement on air
   scan       raw BLE scan for Find My packets
@@ -3073,9 +3399,12 @@ findmy-toolbox.py - everything for the ESP32-S3 Find My beacon
   log        show or follow state/toolbox.log
   help       show this overview
 
-Run it without a command for the interactive menu: it shows what is
-connected (console + Apple ID) and only offers the commands that make
-sense in that state.
+Run it without a command for the interactive menu: one window, entries
+grouped by monitoring / radio / console / provisioning / debug / apple id,
+with the current console, Apple ID and worker state on top. Entries that
+cannot run right now (no console connection, no Apple session) stay listed
+and say why. The retrieval worker is started when the menu opens and
+stopped again when it closes.
 
 Options before or after the command: -v/--verbose (debug logging).
 
@@ -3126,58 +3455,81 @@ COMMAND_CHANNEL = {
     "log": "MAIN", "help": "UI",
 }
 
-# The menu is built from these: the first group never needs the console, the
-# last one only appears with a connection (or offers 'connect' without one).
-MENU_ALWAYS = [
-    ("devices", "list paired devices", ["devices"]),
-    ("sync-ble", "sync the slot counter from BLE", ["sync-ble"]),
-    ("retrieve", "fetch location reports", ["retrieve"]),
-    ("doctor", "account check: known reports return", ["retrieve", "--doctor"]),
-    ("watch", "retrieve + keep polling", ["watch"]),
-    ("monitor", "live dashboard", ["monitor"]),
-    ("verify", "spec-check the advertisement on air", ["verify"]),
-    ("scan", "raw BLE scan", ["scan"]),
-    ("log", "show or follow toolbox.log", ["log"]),
-    ("help", "show the command overview", ["help"]),
+# The menu is one window with groups. monitoring/radio/apple/system work on
+# their own, the uart groups are greyed out until 'connect' identified a
+# beacon. Every entry's argv is complete: [command, ...its own flags], the
+# 4th field is the availability rule (None = always usable).
+MENU_GROUPS = [
+    ("monitoring", CYAN, [
+        ("devices", "list paired devices", ["devices"], None),
+        ("retrieve", "fetch location reports now", ["retrieve"], None),
+        ("doctor", "account check: known reports return",
+         ["retrieve", "--doctor"], None),
+        ("watch", "follow the retrieval worker's log", ["watch"], None),
+        ("restart", "stop + start the retrieval worker",
+         ["retrieve", "--restart"], None),
+        ("monitor", "live dashboard", ["monitor"], None),
+        ("log", "show or follow toolbox.log", ["log"], None),
+    ]),
+    ("radio (ble)", BLUE, [
+        ("verify", "spec-check the advertisement on air", ["verify"], None),
+        ("scan", "raw BLE scan", ["scan"], None),
+        ("sync-ble", "sync the slot counter from BLE", ["sync-ble"], None),
+    ]),
+    ("console (uart)", GREEN, [
+        ("connect", "find, identify and unlock a beacon", ["connect"], None),
+        ("disconnect", "lock the console, drop the connection",
+         ["disconnect"], "console"),
+        ("reset", "reboot a beacon (wake it up)", ["reset"], None),
+        ("sync", "sync the slot counter (USB)", ["sync"], "console"),
+        ("unlock", "unlock the console", ["unlock"], "console"),
+        ("lock", "lock the console", ["lock"], "console"),
+    ]),
+    ("provisioning", YELLOW, [
+        ("pair", "re-pair the connected beacon (new keys)",
+         ["pair", "--force"], "console"),
+        ("pin", "set a new console PIN", ["pin"], "console"),
+        ("wipe", "factory reset: erase keys + PIN", ["wipe"], "console"),
+    ]),
+    ("debug", MAGENTA, [
+        ("test", "console protocol test suite", ["test"], "console"),
+        ("power", "awake/sleep duty cycle", ["power"], "console"),
+    ]),
+    ("apple id", WHITE, [
+        ("apple connect", "log in with an Apple ID",
+         ["apple-id", "connect"], "no-session"),
+        ("apple status", "who is logged in", ["apple-id", "status"], None),
+        ("apple disconnect", "forget the saved session",
+         ["apple-id", "disconnect"], "session"),
+    ]),
+    ("system", WHITE, [
+        ("help", "show the command overview", ["help"], None),
+    ]),
 ]
 
-MENU_CONSOLE = [
-    ("sync", "sync the slot counter (USB)", ["sync"]),
-    ("test", "console protocol test suite", ["test"]),
-    ("power", "awake/sleep duty cycle", ["power"]),
-    ("pin", "set a new console PIN", ["pin"]),
-    ("pair", "re-pair the connected beacon (new keys)", ["pair", "--force"]),
-    ("wipe", "factory reset: erase keys + PIN", ["wipe"]),
-    ("disconnect", "lock the console, drop the connection", ["disconnect"]),
-]
+
+def entry_reason(needs: str | None, conn: dict | None,
+                 apple: str | None) -> str | None:
+    """Why an entry is greyed out right now (None when it is usable)."""
+    if needs == "console" and not conn:
+        return "needs 'connect'"
+    if needs == "session" and not apple:
+        return "no saved Apple session"
+    if needs == "no-session" and apple:
+        return f"logged in as {apple}"
+    return None
 
 
-def menu_sections(conn: dict | None) -> list[tuple[str, list[tuple]]]:
-    """(title, entries) for the current connection state. Every entry's argv
-    is complete: [command, ...its own flags]."""
-    always = [(name, description, argv)
-              for name, description, argv in MENU_ALWAYS]
-    apple = session_account_name()
-    if apple:
-        apple_entries = [("apple disconnect",
-                          f"forget the saved session ({apple})",
-                          ["apple-id", "disconnect"])]
-    else:
-        apple_entries = [("apple connect", "log in with an Apple ID",
-                          ["apple-id", "connect"])]
-    if conn:
-        common = ["--id", conn["id"], "--port", conn["port"]]
-        uart = [(name, description, argv + common)
-                for name, description, argv in MENU_CONSOLE]
-        uart.append(("reset", "reboot the connected beacon",
-                     ["reset", "--port", conn["port"]]))
-        title = f"console ({conn['id']} on {conn['port']})"
-    else:
-        uart = [("connect", "find, identify and unlock a beacon", ["connect"]),
-                ("reset", "reboot a beacon (wake it up)", ["reset"])]
-        title = "console"
-    return [("no uart needed", always), ("apple id", apple_entries),
-            (title, uart)]
+def entry_argv(argv: list[str], needs: str | None,
+               conn: dict | None) -> list[str]:
+    """Complete an entry's argv with the connected console, if there is one."""
+    if not conn:
+        return list(argv)
+    if needs == "console":
+        return argv + ["--id", conn["id"], "--port", conn["port"]]
+    if argv[0] == "reset":
+        return argv + ["--port", conn["port"]]
+    return list(argv)
 
 
 def status_lines(conn: dict | None = None) -> list[str]:
@@ -3194,7 +3546,8 @@ def status_lines(conn: dict | None = None) -> list[str]:
     newest_age = None
     report_count = 0
     now = datetime.now(timezone.utc)
-    for state in results.values():
+    for dev in devices:
+        state = results.get(dev.get("id"))
         if not isinstance(state, dict):
             continue
         reports = state.get("reports")
@@ -3206,12 +3559,6 @@ def status_lines(conn: dict | None = None) -> list[str]:
             age = (now - max(times)).total_seconds()
             newest_age = age if newest_age is None else min(newest_age, age)
 
-    worker = p(DIM, "stopped")
-    if info and info["alive"]:
-        worker = p(GREEN, f"running (pid {info['pid']})")
-    elif info:
-        worker = p(YELLOW, "stale lock file")
-
     console = p(YELLOW, "not connected")
     if conn:
         state = "paired" if conn.get("paired") else "unpaired"
@@ -3221,47 +3568,86 @@ def status_lines(conn: dict | None = None) -> list[str]:
     apple_line = (p(GREEN, f"connected as {apple}") if apple
                   else p(YELLOW, "not connected"))
 
-    lines = [
+    worker = p(DIM, "not running")
+    if info and info["alive"]:
+        worker = p(GREEN, f"running (pid {info['pid']})")
+    elif info:
+        worker = p(YELLOW, "stale lock file")
+    elif not apple:
+        worker = p(DIM, "not started (no Apple session)")
+
+    reports_line = p(DIM, f"reports : {report_count}, nothing fetched yet")
+    if newest_age is not None:
+        reports_line = p(DIM, f"reports : {report_count}, "
+                              f"newest {fmt_age(newest_age)} ago  ") + \
+            ui_bar(newest_age / FRESH_WARN, 18, freshness_color(newest_age))
+
+    return [
         p(DIM, f"console : {console}"),
         p(DIM, f"apple   : {apple_line}"),
         p(DIM, f"devices : {len(devices)}"
                + (f" ({', '.join(d['id'] for d in devices)})" if devices else "")),
-        p(DIM, f"reports : {report_count}"
-               + (f", newest {fmt_age(newest_age)} ago" if newest_age is not None
-                  else "")),
+        reports_line,
         p(DIM, f"worker  : {worker}"),
         p(DIM, f"log     : {LOG_FILE.relative_to(SCRIPTS_DIR)}"),
     ]
-    return lines
 
 
 def menu() -> int:
     p = lambda color, text: paint(color, text, ui=True)
-    width = 74
     global CONNECTED
+    running = retrieve_running_info()
+    had_worker = bool(running and running["alive"])
+    try:
+        if not had_worker and session_account_name():
+            retrieve_start_bg(quiet=True)
+    except OSError as exc:
+        log_error("WORKER", f"could not start the retrieval worker: {exc}")
+
     try:
         while True:
             sys.stdout.write("\033[2J\033[H")
-            print(p(CYAN + BOLD, f"╔{'═' * (width - 2)}╗"))
-            title = " ESP32 FIND MY - TOOLBOX "
-            print(p(CYAN + BOLD, f"║{title}{' ' * (width - 2 - len(title))}║"))
-            print(p(CYAN + BOLD, f"╚{'═' * (width - 2)}╝"))
-            for line in status_lines(CONNECTED):
-                print("  " + line)
-            print()
+            apple = session_account_name()
+            entries: list[tuple[str, str, list[str], str | None]] = []
+            body = status_lines(CONNECTED)
+            body.append("")
+            for title, color, group in MENU_GROUPS:
+                body.append(p(color + BOLD, f"  {title.upper()}"))
+                for name, description, argv, needs in group:
+                    reason = entry_reason(needs, CONNECTED, apple)
+                    done = entry_argv(argv, needs, CONNECTED)
+                    entries.append((name, description, done, reason))
+                    left = f"   {len(entries):>2}) {name:<16} {description}"
+                    if not reason:
+                        body.append(left)
+                    elif text_width(left) + len(reason) + 2 <= MENU_COLS:
+                        gap = MENU_COLS - text_width(left) - len(reason)
+                        body.append(p(DIM, left) + " " * gap
+                                    + p(YELLOW, reason))
+                    else:
+                        head = f"   {len(entries):>2}) {name:<16} "
+                        short = truncate(reason, MENU_COLS - text_width(head))
+                        body.append(p(DIM, head) + p(YELLOW, short))
+                body.append("")
+            body.append("    0) quit")
 
-            entries: list[tuple[str, str, list[str]]] = []
-            for section, items in menu_sections(CONNECTED):
-                if not items:
-                    continue
-                print(p(BOLD, f"  {section}:"))
-                for name, description, argv in items:
-                    entries.append((name, description, argv))
-                    print(f"  {len(entries):>2}) {name:<16} {description}")
-                print()
-            print("   0) quit")
-            print()
+            info = retrieve_running_info()
+            if info and info["alive"]:
+                worker_tag = p(GREEN, "● worker running")
+            elif info:
+                worker_tag = p(YELLOW, "● worker stale")
+            else:
+                worker_tag = p(DIM, "○ worker stopped")
+            clock = datetime.now().astimezone().strftime("%H:%M:%S")
+            for line in ui_frame("ESP32 FIND MY · TOOLBOX", body,
+                                 right_label=f"{worker_tag}  {clock}",
+                                 footer="0 quit   a number, a name or any "
+                                        "command"):
+                print(line)
+
             raw = input(p(BOLD, "> ")).strip()
+            if not raw:
+                continue
             choice = raw.lower()
             if choice in ("0", "q", "quit", "exit"):
                 log("UI", "menu closed")
@@ -3282,13 +3668,18 @@ def menu() -> int:
                 if typed and typed[0] not in COMMANDS:
                     typed[0] = typed[0].lower()
                 if typed and typed[0] in COMMANDS:
-                    picked = (typed[0], "", typed)  # type a command by hand
+                    picked = (typed[0], "", typed, None)  # typed by hand
             if picked is None:
                 print(p(RED, f"unknown choice '{choice}'"))
                 time.sleep(1.0)
                 continue
+            if picked[3]:
+                print(p(YELLOW, f"\n'{picked[0]}' is not available: "
+                                f"{picked[3]}"))
+                time.sleep(1.5)
+                continue
 
-            name, _description, argv = picked
+            name, _description, argv, _reason = picked
             log("UI", f"menu: {' '.join(argv)}")
             args = build_parser().parse_args(argv)
             try:
@@ -3305,9 +3696,14 @@ def menu() -> int:
                 print(p(YELLOW, f"\n{name} exited with status {rc}"))
             input(p(DIM, "\npress Enter to return to the menu "))
     except (EOFError, KeyboardInterrupt):
-        sys.stdout.write("\n")
+        sys.stdout.write(RESET + "\n")
         log("UI", "menu closed")
         return 0
+    finally:
+        info = retrieve_running_info()
+        if not had_worker and info and info["alive"]:
+            log("UI", "menu closed: stopping the worker it started")
+            retrieve_stop()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3333,13 +3729,17 @@ def build_parser() -> argparse.ArgumentParser:
     pair.add_argument("--force", action="store_true",
                       help="overwrite an existing device id (confirms on a TTY)")
     pair.add_argument("--yes", "-y", action="store_true",
-                      help="no confirmation for --force on a terminal")
+                      help="no confirmation and no prompts on a terminal "
+                           "(timings keep their defaults)")
     pair.add_argument("--debug", type=int, choices=[0, 1], default=None,
                       help="device debug flag after pairing")
     pair.add_argument("--adv-ms", type=int,
-                      help="advertisement period in ms (200..60000)")
-    pair.add_argument("--rot-sec", type=int, help="key rotation period (s)")
-    pair.add_argument("--dbg-sec", type=int, help="console countdown (s)")
+                      help="advertisement period in ms (200..60000, "
+                           "prompted when omitted)")
+    pair.add_argument("--rot-sec", type=int, help="key rotation period (s, "
+                                                  "prompted when omitted)")
+    pair.add_argument("--dbg-sec", type=int, help="console countdown (s, "
+                                                  "prompted when omitted)")
 
     connect = sub.add_parser("connect", parents=[verbose],
                              help="identify + unlock a beacon over UART")
@@ -3427,14 +3827,17 @@ def build_parser() -> argparse.ArgumentParser:
                           help="tail the retrieval log")
     retrieve.add_argument("--stop", action="store_true",
                           help="stop the background worker")
+    retrieve.add_argument("--restart", action="store_true",
+                          help="stop the worker and start it again")
     retrieve.add_argument("--lines", type=int, default=50,
                           help="log lines to show with --follow")
 
     watch = sub.add_parser("watch", parents=[verbose],
-                           help="retrieve and keep polling")
-    watch.add_argument("--device", default=DEFAULT_DEVICE)
-    watch.add_argument("--interval", type=int, default=DEFAULT_WATCH,
-                       help="seconds between fetches")
+                           help="start the worker and follow its log")
+    watch.add_argument("--device", default=DEFAULT_DEVICE,
+                       help="only log lines mentioning this device")
+    watch.add_argument("--lines", type=int, default=40,
+                       help="log lines to show before following")
 
     monitor = sub.add_parser("monitor", parents=[verbose],
                              help="live dashboard")
