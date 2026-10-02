@@ -1,0 +1,12 @@
+07:44:58 [PAIR    ] -> generating master key + SKN for 'bike-tag'
+07:44:58 [PAIR    ] -> KEYS accepted by the device, slot reset to 0
+07:44:59 [PAIR    ] -> cross-check with the findmy derivation: OK
+07:44:59 [PAIR    ] -> rotating the console PIN -> **** (stored in devices.json)
+07:45:12 [SYNC    ] -> bike-tag is at slot 412 (synced over USB)
+07:45:30 [RETRIEVE] -> logged in with the saved session (no password needed)
+07:45:33 [RETRIEVE] -> bike-tag: queried slots 383..412, 12 new report(s)
+07:45:34 [RETRIEVE] -> laptop: queried slots 383..411, 5 new report(s)
+07:45:34 [RETRIEVE] -> session finished, 17 new report(s) in reports.json
+07:46:02 [VERIFY  ] -> slot 412 key found on air (mac AA:BB:CC:DD:EE:FF, rssi -38)
+07:46:40 [MONITOR ] -> rendered dashboard for 2 device(s)
+07:47:05 [MAIN    ] -> showed the last 12 log line(s)

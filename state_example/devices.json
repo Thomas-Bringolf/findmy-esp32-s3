@@ -1,0 +1,32 @@
+{
+  "devices": [
+    {
+      "id": "bike-tag",
+      "port": "/dev/ttyACM0",
+      "adv_ms": 2000,
+      "rot_sec": 120,
+      "dbg_sec": 600,
+      "slot_seconds": 120,
+      "last_known_slot": 412,
+      "slot_synced_at": "2026-09-28T07:45:12+00:00",
+      "paired_at": "2026-09-20T16:03:41+00:00",
+      "pin": "42424242",
+      "master_key": "9d/eXV3f77PJEcnqMMqco8yLSFK0CtkYrSoFLQ==",
+      "skn": "XAtX2QYgxH1Q1WwOMfdqcml6aKsfOpjhCwDgCLyENuk="
+    },
+    {
+      "id": "laptop",
+      "port": "/dev/ttyACM1",
+      "adv_ms": 2000,
+      "rot_sec": 120,
+      "dbg_sec": 600,
+      "slot_seconds": 120,
+      "last_known_slot": 411,
+      "slot_synced_at": "2026-09-28T07:43:30+00:00",
+      "paired_at": "2026-09-25T09:11:07+00:00",
+      "pin": "87654321",
+      "master_key": "TW0MhEA2qlPIB3soXRmlJfQevjHyZosqo/fdrQ==",
+      "skn": "RHKphtKxbDZSofdXVPLjtQWJnija0V9XNBFCQLBry3I="
+    }
+  ]
+}

@@ -1,0 +1,122 @@
+{
+  "bike-tag": {
+    "last_fetched_slot": 421,
+    "reports": [
+      {
+        "slot": 406,
+        "type": "primary",
+        "time": "2026-09-28T07:50:33+02:00",
+        "latitude": 12.3456,
+        "longitude": 67.8901,
+        "accuracy_m": 34,
+        "confidence": 1,
+        "status": 0
+      },
+      {
+        "slot": 409,
+        "type": "primary",
+        "time": "2026-09-28T07:54:18+02:00",
+        "latitude": 12.3465,
+        "longitude": 67.8912,
+        "accuracy_m": 54,
+        "confidence": 0,
+        "status": 0
+      },
+      {
+        "slot": 412,
+        "type": "primary",
+        "time": "2026-09-28T07:58:23+02:00",
+        "latitude": 12.3474,
+        "longitude": 67.8923,
+        "accuracy_m": 40,
+        "confidence": 0,
+        "status": 0
+      },
+      {
+        "slot": 415,
+        "type": "primary",
+        "time": "2026-09-28T08:02:20+02:00",
+        "latitude": 12.3483,
+        "longitude": 67.8934,
+        "accuracy_m": 26,
+        "confidence": 1,
+        "status": 0
+      },
+      {
+        "slot": 418,
+        "type": "primary",
+        "time": "2026-09-28T08:07:06+02:00",
+        "latitude": 12.3492,
+        "longitude": 67.8945,
+        "accuracy_m": 23,
+        "confidence": 1,
+        "status": 0
+      },
+      {
+        "slot": 421,
+        "type": "primary",
+        "time": "2026-09-28T08:11:53+02:00",
+        "latitude": 12.3501,
+        "longitude": 67.8956,
+        "accuracy_m": 77,
+        "confidence": 1,
+        "status": 0
+      }
+    ]
+  },
+  "laptop": {
+    "last_fetched_slot": 417,
+    "reports": [
+      {
+        "slot": 405,
+        "type": "primary",
+        "time": "2026-09-28T07:50:10+02:00",
+        "latitude": 12.3456,
+        "longitude": 67.8901,
+        "accuracy_m": 83,
+        "confidence": 0,
+        "status": 0
+      },
+      {
+        "slot": 408,
+        "type": "primary",
+        "time": "2026-09-28T07:55:03+02:00",
+        "latitude": 12.3465,
+        "longitude": 67.8912,
+        "accuracy_m": 34,
+        "confidence": 0,
+        "status": 0
+      },
+      {
+        "slot": 411,
+        "type": "primary",
+        "time": "2026-09-28T07:57:58+02:00",
+        "latitude": 12.3474,
+        "longitude": 67.8923,
+        "accuracy_m": 53,
+        "confidence": 2,
+        "status": 0
+      },
+      {
+        "slot": 414,
+        "type": "primary",
+        "time": "2026-09-28T08:03:19+02:00",
+        "latitude": 12.3483,
+        "longitude": 67.8934,
+        "accuracy_m": 93,
+        "confidence": 0,
+        "status": 0
+      },
+      {
+        "slot": 417,
+        "type": "primary",
+        "time": "2026-09-28T08:07:03+02:00",
+        "latitude": 12.3492,
+        "longitude": 67.8945,
+        "accuracy_m": 48,
+        "confidence": 1,
+        "status": 0
+      }
+    ]
+  }
+}

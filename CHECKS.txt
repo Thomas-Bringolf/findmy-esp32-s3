@@ -1,0 +1,253 @@
+================================================================================
+ESP32-S3 FIND MY BEACON - SYSTEM CHECKLIST
+================================================================================
+Everything that can be verified from this repo, grouped by subsystem.
+Mark each line [x] when it passed. Commands are run from this directory
+(ESP32-tracker) unless stated otherwise.
+
+Conventions:
+  TB   = ./Scripts/findmy-toolbox.py          (add -v for debug logging)
+  IDF  = source ~/.espressif/v6.1/esp-idf/export.sh && cd ESP32
+  PORT = /dev/ttyACM0
+  DEV  = esp32-s3-test  (the id in Scripts/state/devices.json)
+  PIN  = the entry's `pin` column from: TB devices
+
+--------------------------------------------------------------------------------
+0. BUILD AND FLASH
+--------------------------------------------------------------------------------
+[ ] idf.py build completes with no warnings/errors
+[ ] idf.py build output: binary fits the app partition (>40% free)
+[ ] python3 -m py_compile Scripts/findmy-toolbox.py  -> no output, rc 0
+[ ] TB help  -> lists all 16 commands, rc 0
+[ ] TB (no args) with piped input "0" -> menu opens and quits, rc 0
+[ ] idf.py -p PORT flash -> "Hash of data verified", board resets
+[ ] after flash: TB devices shows the device, PIN column populated
+[ ] a freshly flashed/erased board boots with factory PIN 00000000
+    (config mode: TB pin accepts it, device never sleeps until a PIN is set)
+
+--------------------------------------------------------------------------------
+1. UART CONSOLE - FRAMING AND PROTOCOL
+--------------------------------------------------------------------------------
+Automated (69 checks, ~4 min, resets + re-pairs the device):
+[ ] TB test                       -> 69/69 checks passed, rc 0
+[ ] TB test --no-reset            -> same, when the console is already up
+[ ] TB test with a wrong --pin    -> aborts cleanly with a message, rc 1
+
+Manual / ad-hoc (open a console session with TB unlock --reset, then):
+[ ] one command per line, \r or \n both terminate
+[ ] "PING"                     -> PONG fw=3 paired=<0|1>
+[ ] "PING with extra args"     -> PONG (only PING tolerates trailing junk)
+[ ] empty line / whitespace    -> no reply, device stays alive
+[ ] 400-char line              -> dropped whole, next PING still answers
+[ ] unknown command (FOOBAR)   -> ERR CMD
+[ ] "CONFIG 2000 120 600 9"    -> ERR ARGS (extra token never ignored)
+[ ] "CONFIG abc 120 600" / "2000x" / "-1" / "+2000" / "4294967296" -> ERR ARGS
+[ ] "CONFIG  2000  120  600"   -> OK (repeated separators tolerated)
+[ ] reply prefixes parse as: PONG / OK / ERR / LOCKED / SLOT / KEY / STAT /
+    STATUS, while log lines "I (123) tag: ..." are skipped
+[ ] command latency 60-200 ms; "KEY?" and "KEYS" up to ~6 s (P-224
+    derivation ~2.2 s, cached per slot) -> host timeout must be >= 6 s
+[ ] "KEYS" with 6 tokens, "PIN x y", "UNLOCK 12345678 junk", "DEBUG 1 1"
+    -> ERR ARGS (trailing-token rejection everywhere but PING)
+[ ] a reply is never mistaken for the previous command (cmd() drains first)
+
+--------------------------------------------------------------------------------
+2. UART CONSOLE - LOCK, PIN AND ANTI-BRUTEFORCE
+--------------------------------------------------------------------------------
+[ ] boot -> PING answers LOCKED, every other command answers LOCKED
+[ ] UNLOCK <correct>            -> OK UNLOCK, PING then answers PONG
+[ ] UNLOCK <wrong>              -> ERR PIN
+[ ] UNLOCK 12345678 (7/9 digits, letters) -> ERR ARGS (never counted as wrong)
+[ ] LOCK <correct>              -> OK LOCK, PING answers LOCKED again
+[ ] LOCK <wrong>                -> ERR PIN, and the counter is NOT incremented
+[ ] lock is RAM state: after a reset the console is locked again
+[ ] after 5 wrong UNLOCKs       -> ERR LOCK 30, then ERR LOCK for the wait
+[ ] lockout doubles 30/60/... up to 900 s max
+[ ] during lockout the correct PIN is refused (ERR LOCK n)
+[ ] after the wait, correct PIN -> OK UNLOCK and the counter clears
+[ ] the failure counter survives a reset (NVS pinfails); the deadline is
+    re-armed from it instead of being inherited (uart_cmd_start clears it)
+[ ] PIN <8 digits> while paired -> OK PIN; changes the required unlock PIN
+[ ] PIN with letters/short      -> ERR ARGS
+[ ] PIN while unpaired          -> ERR UNPAIRED
+[ ] WIPE with no argument       -> OK WIPE, then reboot
+[ ] WIPE 12345678 (old form)    -> ERR ARGS
+[ ] after WIPE: unpaired, factory PIN 00000000, pinfails reset, config mode
+[ ] KEYS / PIN / SLOT? / KEY? behave as documented in docs/uart-protocol.md
+
+--------------------------------------------------------------------------------
+3. UART CONSOLE - SESSION LIFETIME, COUNTDOWN AND CONFIG MODE
+--------------------------------------------------------------------------------
+[ ] paired device: LOCK starts the dbg_sec countdown; expiry -> one normal
+    frame, then deep sleep for adv_ms (console silent until a reset)
+[ ] while UNLOCKED the countdown is paused: device never sleeps
+[ ] config mode (unpaired OR factory PIN) never sleeps, console always there
+[ ] setting a real PIN ends config mode; the countdown starts working
+[ ] a wrong dbg_sec (e.g. 20/30) is clamped to 600 by the device and the
+    toolbox warns "device clamped dbg_sec to ..." and waits the real value
+[ ] STATUS? reflects adv_ms/rot_sec/dbg_sec after CONFIG; values persist
+    across reset
+[ ] REGRESSION: a fast host right after boot (PING, UNLOCK, STATUS?, CONFIG
+    within ~1 s) must NOT crash the device. It used to panic with
+    "Guru Meditation ... LoadProhibited" in ble_hs_synced() because the UART
+    task ran before ble_adv_host_init(); uart_cmd_start() now runs last and
+    ble_adv_start_chain() is guarded by host_ready.
+    Run: TB unlock --reset && TB sync   (both complete in <2 s) - no reboot,
+    no "device crashed:" lines in Scripts/state/toolbox.log
+[ ] REGRESSION: "Beacon.cmd('')" (empty line) used to raise IndexError in the
+    timeout log message - covered by TB test ("empty line ignored")
+
+--------------------------------------------------------------------------------
+4. BLE BEACON - ADVERTISEMENT CONTENT
+--------------------------------------------------------------------------------
+[ ] TB verify 15     -> PASS, our MAC found, rssi ~-30..-40 dBm in the lab
+[ ] TB scan 15       -> dumps OF packets: mac, rssi, hits, status, 21-byte key
+[ ] advertised key equals KEY? for the current slot (verify does this check)
+[ ] random static address = key[0]|0xC0, key[1..4], (key[5]&0x3f)|0xC0 and
+    BlueZ reports it reversed - scan's "key" matches the KEY? hex
+[ ] frame layout: 1e ff 4c 00 12 19 <status> <21 key bytes> <3 addr hint>
+[ ] status byte bitfield (config.h):
+      0x00 locked, normal mode
+      0x01 unlocked
+      0x02 config mode (unpaired or factory PIN)
+      0x03 unlocked + config
+    check with: TB unlock (status 0x01 on air), TB lock / deep sleep (0x00),
+    TB pin on a factory device (0x02)
+[ ] a non-connectable advertisement (no connections accepted)
+[ ] adv_ms honoured: timestamps of consecutive packets ~2000 ms apart in the
+    steady state (scan twice with a >5 s gap and compare last_seen)
+
+--------------------------------------------------------------------------------
+5. BLE BEACON - TIMINGS
+--------------------------------------------------------------------------------
+[ ] key rotation every rot_sec (default 120 s) = cycles_per_slot = 60 cycles
+[ ] observe a rotation on air: run TB verify twice, ~2 min apart -> different
+    key/MAC; TB sync and TB sync-ble both follow the new slot
+[ ] rotation cost: ~2.15 s of awake time (P-224 derivation + NVS) - visible
+    as an outlier in TB power (max awake ~15 ms normally, ~2200 ms on rotation)
+[ ] steady-state duty cycle: TB power --dbg-sec 60 --seconds 45
+      awake median ~7.3 ms, sleep ~1.992 s, cycle ~1.999 s, duty 0.37 %
+      (measured 23 cycles; 0.37 % without rotation, ~2.2 % with rotation)
+[ ] TB power --rot-sec 20 --seconds 60 -> rotation cycles show up (~2.1-2.2 s)
+[ ] TB power --json state/power_test.json -> file written with keys
+    adv_ms, avg_current_ma, awake_duty, awake_median_us, awake_us, cycles,
+    dbg_sec, port, rot_sec, seconds, sleep_median_us, sleep_us
+[ ] PWR lines are produced only in the steady state, twice per cycle
+    ("PWR wake t=..." and "PWR sleep awake_us=... sleep_us=...")
+[ ] slot index advances in RTC memory across deep sleep (no reset of the
+    schedule); TB sync after a sleep reports the advanced slot
+[ ] deep-sleep wake of an unpaired device returns to the console
+
+--------------------------------------------------------------------------------
+6. BLE BEACON - SYNC FROM THE AIR
+--------------------------------------------------------------------------------
+[ ] TB sync            -> reads SLOT?/KEY?, cross-checks with findmy, saves
+                          last_known_slot + slot_synced_at
+[ ] TB sync-ble --window 20 -> walks the chain slot 0..N, MATCH at the right
+    slot, saves devices.json; works with no USB attached
+[ ] TB sync-ble --device <bogus> -> clean error, rc 1
+[ ] USB and BLE agree on the slot number after the same run
+[ ] "estimated pair time" vs stored paired_at differs only by powered-off time
+[ ] a neighbour's OF beacon is captured but not matched (no false sync)
+
+--------------------------------------------------------------------------------
+7. RETRIEVAL OF REPORTS
+--------------------------------------------------------------------------------
+[ ] TB retrieve                 -> "restored saved session", query window per
+    slot, deduplicated append to state/reports.json, rc 0
+[ ] TB retrieve <apple_id>      -> only needed when state/account_state.json
+    is missing/expired (first login: password + 2FA)
+[ ] incremental: the query window starts at the newest archived slot and
+    never goes back more than --back (30) slots
+[ ] one request per slot (Apple caps batched responses) - visible at -v
+[ ] TB retrieve --watch 30      -> keeps polling, Ctrl-C stops
+[ ] TB watch --interval 5       -> same, own interval
+[ ] TB retrieve --bg            -> returns immediately, prints the worker pid
+    (pid in the message == pid in "retrieve --status")
+[ ] TB retrieve --status        -> "running (pid, started)" / "not running"
+[ ] TB retrieve --bg twice      -> second one refuses: "already running", rc 1
+[ ] TB retrieve --follow --lines 5 -> last lines, then live tail (flushes
+    immediately even when stdout is a pipe), Ctrl-C stops
+[ ] TB retrieve --stop          -> SIGTERM, lock released, status = not running
+[ ] only one worker ever holds Scripts/state/retrieve.lock (flock)
+[ ] a crashed worker leaves a stale lock -> status reports "stale lock file"
+[ ] new reports are printed as they arrive and counted in the summary
+[ ] 0 reports is not an error: "No new reports - keep the beacon near a
+    locked iPhone." (rc 0)
+[ ] TB monitor --once / TB monitor --interval 3
+      freshness colour: green <= 45 min, yellow <= 3 h, red above
+      latest reports table (slot, age, lat, lon, acc) + per-slot coverage strip
+[ ] monitor lists devices that only exist in reports.json (legacy entries)
+
+--------------------------------------------------------------------------------
+8. TOOLBOX UTILITIES (every subcommand)
+--------------------------------------------------------------------------------
+[ ] TB devices            -> table: id, port, slot, adv, rot, dbg, paired, pin
+[ ] TB pair               -> refuses an existing id without --force (rc 1)
+[ ] TB pair --force       -> new keys, KEY? cross-checked against findmy,
+                             fresh PIN printed and stored, slot 0
+[ ] TB pair --new-pin 12345678 -> rejected locally unless 8 digits
+[ ] TB pair --adv-ms/--rot-sec/--dbg-sec/--debug -> reflected in STATUS?
+[ ] TB pin                -> random new PIN, stored in devices.json, device
+                             locked again afterwards
+[ ] TB unlock             -> device left UNLOCKED (stays awake)
+[ ] TB lock               -> device left LOCKED (countdown running)
+[ ] TB unlock --reset     -> works while the device is in its sleep loop
+[ ] TB unlock --pin 11111111 -> rc 1, "wrong PIN (from --pin)", no prompt
+[ ] TB test / power / pin / unlock / lock / sync / pair all accept --reset
+[ ] TB sync --port /dev/ttyUSB9 -> rc 1 with a clean message (no traceback)
+[ ] TB retrieve --status/--follow/--stop without a worker -> rc 0 messages
+[ ] TB log --lines 20 / TB log --follow -> shows/tails state/toolbox.log
+[ ] TB help -> rc 0; unknown command -> argparse error, rc 2
+[ ] TB -v <cmd> and TB <cmd> -v -> DEBUG lines in both positions
+[ ] logging: "HH:MM:SS [CHANNEL] -> message" on stderr (coloured on a TTY)
+    and in state/toolbox.log (rotating 1 MB x 3, mode 600)
+[ ] redaction: no PIN, master key, SKN or password ever appears in the log
+    (grep the current PIN in state/toolbox.log -> no hits; verbose output
+    shows "> UNLOCK ****")
+[ ] menu: every entry maps to the same subcommand; unknown choice -> message
+    and re-prompt; "0"/"q" quits; Ctrl-C quits cleanly
+[ ] menu reports status: devices, reports (age), worker state, log path
+[ ] error handling: UserError/BeaconError/OSError -> one log line + rc 1,
+    KeyboardInterrupt -> rc 130, no tracebacks anywhere
+[ ] all paths are relative to the script -> TB runs from any directory
+[ ] archived scripts live in Scripts/old/ (Makefile, KeyGen, pair_device.py,
+    test_uart.py, ...) and nothing in the firmware build references them
+    (CMakeLists.txt has no KeyGen/PAIRING_PIN block)
+
+--------------------------------------------------------------------------------
+9. DOCUMENTATION
+--------------------------------------------------------------------------------
+[ ] docs/uart-protocol.md matches fw=3 behaviour (lock, PIN, lockout, WIPE
+    without argument, status bitfield, ERR table)
+[ ] docs/firmware.md: state machine, config mode, NVS keys pin/pinfails,
+    FM_PIN_* constants, status byte row
+[ ] docs/power.md, docs/roadmap.md: no references to removed scripts
+[ ] Scripts/README.md describes the toolbox only; root README.md commands
+    all run as printed
+
+--------------------------------------------------------------------------------
+10. SUGGESTED RUN ORDER (end-to-end)
+--------------------------------------------------------------------------------
+  1. python3 -m py_compile Scripts/findmy-toolbox.py
+  2. (IDF) idf.py build && idf.py -p /dev/ttyACM0 flash
+  3. Scripts/findmy-toolbox.py devices
+  4. Scripts/findmy-toolbox.py test              # 69 checks, resets device
+  5. Scripts/findmy-toolbox.py pair --force
+  6. Scripts/findmy-toolbox.py sync && Scripts/findmy-toolbox.py sync-ble
+  7. Scripts/findmy-toolbox.py verify 15 && Scripts/findmy-toolbox.py scan 15
+  8. Scripts/findmy-toolbox.py power --dbg-sec 60 --seconds 45
+  9. Scripts/findmy-toolbox.py unlock --reset && Scripts/findmy-toolbox.py lock
+ 10. Scripts/findmy-toolbox.py retrieve   (then --bg / --status / --follow /
+     --stop)
+ 11. Scripts/findmy-toolbox.py monitor --once
+ 12. Scripts/findmy-toolbox.py log --lines 20
+ 13. grep -c "<current PIN>" Scripts/state/toolbox.log   # must be 0
+
+Known limitations (by design):
+  - reports stay at 0 until a locked iPhone is near the beacon
+  - a CONFIG change applies to the next session only
+  - the console is unreachable while the device is in its sleep loop
+    (use --reset, or leave it unlocked with TB unlock)
+  - only the primary key chain is queried (1 key per slot)
+================================================================================

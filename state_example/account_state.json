@@ -1,0 +1,28 @@
+{
+  "type": "account",
+  "account": {
+    "info": {
+      "account_name": "example.user@icloud.com",
+      "first_name": "Example",
+      "last_name": "User",
+      "trusted_device_2fa": false
+    },
+    "password": "REPLACE-WITH-YOUR-APPLE-ID-PASSWORD",
+    "username": "example.user@icloud.com"
+  },
+  "anisette": {
+    "prov_data": "REPLACE-WITH-ANISETTE-PROVISIONING-DATA",
+    "type": "aniLocal"
+  },
+  "ids": {
+    "devid": "00000000-0000-4000-8000-000000000000",
+    "uid": "00000000-0000-4000-8000-000000000000"
+  },
+  "login": {
+    "data": {
+      "dsid": "0000000000",
+      "mobileme_data": {}
+    },
+    "state": 3
+  }
+}

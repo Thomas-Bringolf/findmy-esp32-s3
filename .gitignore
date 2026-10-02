@@ -1,0 +1,23 @@
+# ------------------------------------------------------------------
+# Scripts/state/ — NEVER commit this folder.
+# It holds the Apple ID + password + anisette session, the per-device
+# private keys (master_key / skn) and every retrieved GPS coordinate.
+# The real directory is replaced by state_example/ in the repository.
+# ------------------------------------------------------------------
+Scripts/state/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# ESP-IDF build artefacts (regenerate with `idf.py build`)
+ESP32/build/
+ESP32/venv/
+ESP32/.cache/
+ESP32/sdkconfig.old
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
