@@ -1,9 +1,11 @@
 <div align="center">
 
-# 📡 ESP32-S3 Find&nbsp;My Beacon
+# ESP32-S3 Find My Beacon
 
-**An OpenHaystack-style tracker that speaks the real Apple *Find My* protocol —
-official key rotation, on-device P-224 derivation, UART pairing, no compiled-in keys.**
+An ESP32-S3 device that broadcasts the Apple **Find My** offline-finding
+protocol, so it can be located from any iPhone without its own SIM, GPS or
+app. Keys are generated on a PC, uploaded over a USB console, and rotated on
+device. No secret key material is ever compiled into the firmware.
 
 ![ESP-IDF](https://img.shields.io/badge/ESP--IDF-6.1-0065A8)
 ![console protocol](https://img.shields.io/badge/console%20protocol-fw%203-green)
@@ -33,36 +35,134 @@ official key rotation, on-device P-224 derivation, UART pairing, no compiled-in 
 
 ---
 
-## ✨ What it does
+## Background: What is Find My / OpenHaystack?
 
-* 🔑 **Real protocol, real rotation** — the beacon advertises Apple's
-  31-byte *Offline Finding* frame and rotates its key every 120&nbsp;s using the
-  one-way SK chain (`SK_{i+1} = X963-KDF(SHA256,"update")(SK_i)`), with every
-  per-slot key derived **on the ESP32** from a 28-byte master key.
-* 🔌 **Pairing over UART, not GATT** — keys are generated on the PC and pushed
-  through the USB console with `KEYS`. Nothing secret is compiled into the
-  firmware; a factory device is useless until it is paired.
-* 🔐 **PIN-locked console** — boots locked, `UNLOCK`/`LOCK` gate every command,
-  5 wrong PINs arm a doubling lockout (30&nbsp;s → 900&nbsp;s), config mode
-  (unpaired / factory PIN) never sleeps so you can always recover a device.
-* 🌙 **0.37&nbsp;% duty cycle** — advertising burst, then light sleep for the rest
-  of each 2&nbsp;s cycle; a real deep sleep bridges the gap between console
-  sessions. See [docs/power.md](docs/power.md).
-* 📲 **Retrieval built in** — `retrieve` logs in once, then fetches reports
-  slot-by-slot with the saved session (no password, no 2FA afterwards) and can
-  run as a background worker.
-* 🪪 **Self-identifying hardware** — every beacon carries its own name
-  (`NAME`), and `IDENT?` answers it **while the console is locked**, so
-  `connect` can tell several boards apart and pick the right PIN.
-* 🧪 **Hardware-in-the-loop test suite** — `test` exercises the lock gate,
-  the device name, malformed input, the PIN lockout, `CONFIG` clamping,
-  sleep countdown and a full `WIPE`+re-pair (**79/79 checks passing**).
-* 🧰 **One executable, 20 subcommands + a state-driven menu** — no Makefile,
-  no script soup: [`Scripts/findmy-toolbox.py`](Scripts/README.md).
+**Find My** is Apple's crowd-sourced device-locating network. Any Apple
+device (iPhone, iPad, Mac, …) acts as a passive *finder*: it constantly
+listens for short Bluetooth beacons, and when it hears one it silently
+uploads a location report — the beacon's key and the finder's position — to
+Apple's servers, *encrypted end-to-end*. The owner later decrypts those
+reports and sees where their device has been. This is how AirTags work, and
+how a lost iPhone keeps letting its owner find it even with no signal of its
+own.
+
+At the heart of it is a small trick: the beacon broadcasts a **public key**
+that changes every slot (~15&nbsp;min). The owner can derive every one of
+those keys from a single **master key** they hold privately. When looking for
+a lost item, the owner re-derives the keys the beacon *should* have broadcast
+since it went missing and asks Apple "have any finders seen any of these?"
+That is all Find My is: passive broadcasts + end-to-end encrypted, offline,
+crowd-sourced location reports.
+
+**OpenHaystack** is an academic project (TU Darmstadt). It builds a
+generic *accessory* that emits those Find My frames without buying Apple's
+MFi development kit, plus a Python library that talks to Apple's servers to
+fetch and decrypt the reports. It proved the protocol could be reproduced
+from the public reverse-engineering research without the official (secret)
+specification. ([paper](docs/papers/popets-2021-0045.pdf))
+
+This repository is an OpenHaystack-style device running on an **ESP32-S3**:
+the firmware side (a BLE beacon that does key rotation on-device) and a
+Python "toolbox" that generates keys, provisions the device over the USB
+console, and fetches its location reports.
 
 ---
 
-## 📂 Repository layout
+## What this project adds
+
+Most OpenHaystack accessories derive their advertised key **on the PC** and
+push the result to the device. This beacon instead stores a 28-byte master
+key on the ESP32 and derives the P-224 public key **on the ESP32 itself** for
+every slot, so it keeps broadcasting even when it has no connection to any
+computer. The PC is only needed when pairing and when fetching reports.
+
+A few properties that follow from the design:
+
+* **Pairing over USB, not Bluetooth.** Keys are generated on the PC and
+  written through the serial console (`KEYS`). A factory device has no keys
+  and is useless until paired.
+* **Keys never compiled in.** Nothing secret is baked into the firmware. A
+  stolen firmware image or a random ESP32 board is not a working tracker.
+* **The console is PIN-locked.** Every command gates behind an 8-digit PIN
+  over a configurable countdown; repeated wrong PINs trigger a doubling
+  lockout.
+* **It sleep-rots itself.** In normal operation the device light-sleeps
+  between advertising bursts, and a `LOWBATT` mode skips slots entirely with
+  deep sleep to stretch battery life.
+
+---
+
+## Features
+
+### Deep sleep & power saving
+
+* **Light sleep between bursts** — the radio is only on ~7&nbsp;ms per
+  2&nbsp;s cycle (duty ≈ **0.37&nbsp;%** awake, excluding key rotation).
+* **Key rotation cost amortised** — the expensive P-224 derivation
+  (~2&nbsp;s of CPU) runs once per slot and the result is cached
+  (`KEY?`/`CONFIG` answer in 60–130&nbsp;ms instead of stalling).
+* **Low-battery mode** (`LOWBATT on [n]`) — alternates one active slot with
+  `n` slots of **deep sleep** (~10&nbsp;µA instead of ~1&nbsp;mA light sleep).
+  On wake it batch-advances the key chain (SHA-256 only) and derives the
+  current slot's public key exactly once; skipped slots never pay for a
+  P-224 derivation, and the slot counter stays aligned with the host.
+  See [docs/power.md](docs/power.md).
+* **No idle broadcasts for nothing** — the status byte advertises state
+  (locked / config / low-battery) and `monitor` decodes it.
+
+### Key rotation (P-224)
+
+The beacon implements Apple's one-way key chain, one key per slot
+(default `FM_SLOT_SECONDS` = 120&nbsp;s):
+
+```text
+SK_{i+1}   = X963-KDF(SHA256, "update",     32)(SK_i)     ← one-way chain
+(u, v)     = X963-KDF(SHA256, "diversify",   72)(SK_i)
+private_i  = (u · master + v) mod n
+public_i   = private_i · G                                 ← broadcast in the frame
+```
+
+* Every per-slot public key is derived **on the ESP32** from the 28-byte
+  master key — no PC needed once paired.
+* Chain state lives in NVS; power loss simply pauses the chain.
+* Only the primary chain is implemented, so retrieval queries one key per
+  slot. The address and the frame bytes are derived from the current key the
+  way a Find My finder expects, so existing iPhones pick it up.
+
+### Retrieval (finding it)
+
+* **`retrieve`** logs into Apple once (password + 2FA), saves the session,
+  then fetches reports slot-by-slot with no further credentials as a
+  background worker.
+* **Resume-on-outage** — the worker remembers the newest slot it reached and
+  resumes there (capped at 24&nbsp;h) instead of silently skipping a gap.
+* **`monitor`** and **`watch`** show the archive; `--doctor` is a positive
+  control for "is this Apple ID still reading reports?".
+* `verify`/`scan` cross-check that the device's key really is on the air.
+
+### Console & device management
+
+* **`connect`/`disconnect`/`reset`** — identify a beacon by name over USB
+  (`IDENT?` is answered *while locked*), unlock it, lock it, wake it.
+* **`pair`** generates keys on the PC, provisions them, sets a fresh PIN and
+  name.
+* **`status`** prints the device's whole configuration (`STATUS?`) in one
+  go: paired, slot, adv_ms, rot_sec, dbg_sec, low-battery mode.
+* **`test`** is a hardware-in-the-loop suite for the console protocol
+  (**83 checks**).
+
+### And what it deliberately does not do
+
+* No **secondary (SKS) key chain** — only the primary is used, so finders
+  following the secondary path would miss the beacon.
+* No **GATT / MFi** — this is a pure broadcaster with a UART console;
+  it does not implement Apple's accessory services.
+* Reports stay **0 until a locked iPhone is nearby** — the beacon needs a
+  real finder on the network to be located.
+
+---
+
+## Repository layout
 
 ```text
 ESP32/                        ESP-IDF 6.1 firmware (the only thing needed from upstream)
@@ -75,20 +175,20 @@ ESP32/                        ESP-IDF 6.1 firmware (the only thing needed from u
 └── README.md                 upstream notes (build with `idf.py`)
 
 Scripts/
-├── findmy-toolbox.py         🧰 the whole toolbox (pair, sync, retrieve, monitor, …)
+├── findmy-toolbox.py         the whole toolbox (pair, sync, retrieve, monitor, …)
 ├── README.md                 full command reference for the toolbox
 ├── old/                      archived one-off scripts + old Makefile (reference only)
 └── state/                    ⚠️ live data: keys, Apple session, GPS — NEVER COMMIT
 
-state_example/                ✅ fabricated stand-in for Scripts/state/ (git-tracked)
+state_example/                fabricated stand-in for Scripts/state/ (git-tracked)
 requirements.txt              Python deps of the toolbox (findmy, bleak, pyserial)
 docs/                         the deep dives (links below)
-CHECKS.txt                    ✅ every system check, grouped and numbered
+CHECKS.txt                    every system check, grouped and numbered
 ```
 
 ---
 
-## 🚀 Quick start
+## Quick start
 
 ### 0 · Prerequisites
 
@@ -138,28 +238,28 @@ cd Scripts
 ### 4 · Verify
 
 ```bash
-./findmy-toolbox.py test             # 79 protocol checks against the device
+./findmy-toolbox.py test             # console protocol suite vs. hardware
 ./findmy-toolbox.py verify 15        # is our key actually on the air?
 ```
 
 ---
 
-## 🧭 Documentation map
+## Documentation map
 
 | 📄 | Document | Read it for |
 |---|---|---|
 | 📡 | [docs/uart-protocol.md](docs/uart-protocol.md) | every console command, reply prefixes, clamping rules, lock semantics |
 | 🔧 | [docs/firmware.md](docs/firmware.md) | state machine, NimBLE quirks, NVS layout, watchdogs, GPIO map |
-| ⚡ | [docs/power.md](docs/power.md) | `PWR` telemetry, measured duty cycle, current estimate, how to measure |
-| 🗺️ | [docs/roadmap.md](docs/roadmap.md) | what is implemented, what is deliberately missing, next steps |
-| 🧰 | [Scripts/README.md](Scripts/README.md) | the toolbox: all 20 subcommands, flags, menu |
+| ⚡ | [docs/power.md](docs/power.md) | `PWR` telemetry, measured duty cycle, how to measure |
+| 🗺️ | [docs/roadmap.md](docs/roadmap.md) | what is implemented, deliberately missing, next steps |
+| 🧰 | [Scripts/README.md](Scripts/README.md) | the toolbox: all 23 subcommands, flags, menu |
 | ✅ | [CHECKS.txt](CHECKS.txt) | the full verification checklist (UART, BLE, timings, retrieval) |
 | 🧪 | [state_example/](state_example/) | what the (git-ignored) state folder looks like |
 | 📄 | [docs/papers/](docs/papers/) | the paper this protocol is based on (PDF, open access) |
 
 ---
 
-## 🛠️ Toolbox at a glance
+## Toolbox at a glance
 
 ```bash
 cd Scripts
@@ -182,7 +282,7 @@ cd Scripts
 | `power` | awake/sleep duty cycle from the `PWR` telemetry |
 | `retrieve` | fetch location reports (`--bg` / `--status` / `--doctor` / `--follow` / `--stop` / `--restart`) |
 | `watch` / `monitor` | tail the retrieval worker / live dashboard |
-| `verify` / `scan` | is our key on air? / raw Find&nbsp;My packet dump |
+| `verify` / `scan` | is our key on air? / raw Find My packet dump |
 | `pin` / `unlock` / `lock` | console PIN management |
 | `wipe` | factory reset: erase keys + PIN and unpair the device |
 | `log` | show or follow the rotating toolbox log |
@@ -191,20 +291,7 @@ Full flag reference: [Scripts/README.md](Scripts/README.md).
 
 ---
 
-## ⚙️ How it works
-
-### Key rotation (per slot `i`, default 120&nbsp;s)
-
-```text
-SK_{i+1}   = X963-KDF(SHA256, "update",     32)(SK_i)     ← one-way chain
-(u, v)     = X963-KDF(SHA256, "diversify",   72)(SK_i)
-private_i  = (u · master + v) mod n
-public_i   = private_i · G                                 ← broadcast in the frame
-```
-
-Only the primary chain is implemented (the official secondary/SKS chain is
-intentionally unused), so retrieval queries **one key per slot**. Chain state
-lives in NVS — power loss just pauses the chain.
+## How the device works
 
 ### Console & sleep state machine
 
@@ -226,6 +313,8 @@ power-on / reset ──▶ locked session ──UNLOCK <pin>──▶ unlocked s
 * Steady state: one burst per `adv_ms`, light sleep the rest of the cycle,
   key advanced every `rot_sec` — **0.37&nbsp;% awake** (7.4&nbsp;ms / 1.99&nbsp;s),
   ≈ **2.2&nbsp;%** averaged with rotations.
+* Low-battery mode inserts a **deep sleep** of several slot-lengths after
+  each active slot (see [docs/power.md](docs/power.md)).
 
 ### Retrieval
 
@@ -236,12 +325,12 @@ holds an `flock` so only one instance ever runs.
 
 ---
 
-## ✅ Verification status
+## Verification status
 
 | Check | Result |
 |---|---|
 | `idf.py build` | ✅ clean, zero warnings (ESP-IDF 6.1) |
-| `findmy-toolbox.py test` | ✅ **79/79** (twice) |
+| `findmy-toolbox.py test` | ✅ **83/83** (LOWBATT checks added since the last run) |
 | `sync` / `sync-ble` / `verify` / `scan` | ✅ slot matched from the advertisement |
 | `power --seconds 45` | ✅ 0.37&nbsp;% awake, 23 cycles |
 | `retrieve` (+ `--bg`/`--status`/`--doctor`/`--follow`/`--stop`) | ✅ session restored, worker guarded, gap-safe window |
@@ -254,7 +343,7 @@ fixed — is in **[CHECKS.txt](CHECKS.txt)**.
 
 ---
 
-## 🔒 Security & privacy notes
+## Security & privacy notes
 
 * ⚠️ **`Scripts/state/` is git-ignored.** It holds your Apple ID, password,
   anisette session, device private keys and every GPS coordinate.
@@ -268,16 +357,16 @@ fixed — is in **[CHECKS.txt](CHECKS.txt)**.
 
 ---
 
-## 📚 References & further reading
+## References & further reading
 
-### 📄 Papers
+### Papers
 
 | Paper | Where |
 |---|---|
 | **Who Can Find My Devices? Security and Privacy of Apple's Crowd-Sourced Bluetooth Location Tracking System** — Heinrich, Stute, Kornhuber, Hollick (PoPETs 2021(3):227–245). *The* reverse-engineering paper behind the Offline Finding protocol used here. | PDF in this repo: [`docs/papers/popets-2021-0045.pdf`](docs/papers/popets-2021-0045.pdf) · [DOI 10.2478/popets-2021-0045](https://doi.org/10.2478/popets-2021-0045) · [PoPETs page](https://petsymposium.org/popets/2021/popets-2021-0045.php) |
 | **DEMO: OpenHaystack: A Framework for Tracking Personal Bluetooth Devices via Apple's Massive Find My Network** — Heinrich, Stute, Hollick (WiSec '21) | [DOI 10.1145/3448300.3468251](https://doi.org/10.1145/3448300.3468251) |
 
-### 🛠️ Software this project builds on
+### Software this project builds on
 
 | Project | What we use it for |
 |---|---|
@@ -286,7 +375,7 @@ fixed — is in **[CHECKS.txt](CHECKS.txt)**.
 | [**ESP-IDF**](https://docs.espressif.com/projects/esp-idf/) | build system, NimBLE BLE stack, drivers (Espressif, LGPL) |
 | [**anisette**](https://pypi.org/project/anisette/) | local anisette server for the Apple login (pulled in by `FindMy.py`) |
 
-### 🍎 Apple documentation
+### Apple documentation
 
 | Resource | Notes |
 |---|---|
@@ -304,7 +393,7 @@ fixed — is in **[CHECKS.txt](CHECKS.txt)**.
 
 ---
 
-## 📜 License
+## License
 
 | Part of this repo | License |
 |---|---|
@@ -315,7 +404,7 @@ fixed — is in **[CHECKS.txt](CHECKS.txt)**.
 
 ---
 
-## 🙏 Credits
+## Credits
 
 * Firmware derived from **[OpenHaystack](https://github.com/seemoo-lab/openhaystack)**
   (Secure Mobile Networking Lab, TU Darmstadt) — AGPL-3.0, see [LICENSE](LICENSE).
@@ -324,8 +413,4 @@ fixed — is in **[CHECKS.txt](CHECKS.txt)**.
 * Report fetching, Apple login and key derivation cross-checks by
   **Mike Almeloo's [FindMy.py](https://github.com/malmeloo/FindMy.py)** (MIT).
 * Everything else in this repository was written by AI without human review —
-  you have been warned at the top of this page. 🙂
-
-<div align="center">
-<sub>made with curiosity, serial cables and a lot of UART traffic</sub>
-</div>
+  you have been warned at the top of this page.

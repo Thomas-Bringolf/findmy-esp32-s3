@@ -7,7 +7,7 @@ this pass; the rest are proposals.
 
 - Console protocol hardened and fully tested: strict numeric parsing,
   overflow-safe line reader, `WIPE`, `fw=2`, pairing window never consumed
-  by a failed `KEYS` — now `findmy-toolbox.py test` (79 checks); the old
+  by a failed `KEYS` — now `findmy-toolbox.py test` (83 checks); the old
   standalone `Scripts/old/test_uart.py` is archived.
 - Key rotation in the debug window actually runs (it used to wait for a GAP
   event NimBLE never sends) — verified with three rotations in 60 s.
@@ -34,6 +34,14 @@ this pass; the rest are proposals.
   atomically and the menu survives archive entries it cannot parse.
   Replaces `Scripts/old/retrieve_loop.sh`, which had been calling a
   trashed script since the repository cleanup.
+- Low-battery mode: `LOWBATT on|off [n]` alternates one active slot with a
+  deep sleep of `n` slot-lengths, batch-advancing the SK chain on wake
+  (SHA-256 only) and deriving the current slot's P-224 key exactly once.
+  `FM_STATUS_LOWBATT` (0x04) is advertised; `STATUS?` returns `lomode`/
+  `loslots`; a `status` toolbox command prints the whole config from
+  `STATUS?`; `pair --lomode N` and a `lb` column in `devices` round it out.
+  Power measured: deep-sleep gap + one P-224 catch-up per active+sleep pair
+  ([power.md](power.md)).
 
 ## Power
 

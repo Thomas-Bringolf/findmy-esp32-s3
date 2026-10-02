@@ -31,8 +31,8 @@ Conventions:
 --------------------------------------------------------------------------------
 1. UART CONSOLE - FRAMING AND PROTOCOL
 --------------------------------------------------------------------------------
-Automated (79 checks, ~4 min, resets + re-pairs the device):
-[ ] TB test                       -> 79/79 checks passed, rc 0
+Automated (83 checks, ~4 min, resets + re-pairs the device):
+[ ] TB test                       -> 83/83 checks passed, rc 0
 [ ] TB test --no-reset            -> same, when the console is already up
 [ ] TB test with a wrong --pin    -> aborts cleanly with a message, rc 1
 
@@ -133,8 +133,10 @@ Manual / ad-hoc (open a console session with TB unlock --reset, then):
       0x01 unlocked
       0x02 config mode (unpaired or factory PIN)
       0x03 unlocked + config
+      0x04 low-battery mode (skipping slots; may combine with unlocked/config)
     check with: TB unlock (status 0x01 on air), TB lock / deep sleep (0x00),
-    TB pin on a factory device (0x02)
+    TB pin on a factory device (0x02), TB lowbatt on (0x04; combines with
+    the unlocked 0x01 while the console is open, e.g. 0x05)
 [ ] a non-connectable advertisement (no connections accepted)
 [ ] adv_ms honoured: timestamps of consecutive packets ~2000 ms apart in the
     steady state (scan twice with a >5 s gap and compare last_seen)
@@ -159,6 +161,25 @@ Manual / ad-hoc (open a console session with TB unlock --reset, then):
 [ ] slot index advances in RTC memory across deep sleep (no reset of the
     schedule); TB sync after a sleep reports the advanced slot
 [ ] deep-sleep wake of an unpaired device returns to the console
+
+--------------------------------------------------------------------------------
+5b. LOW-BATTERY MODE (LOWBATT on|off [n])
+--------------------------------------------------------------------------------
+[ ] TB lowbatt on / off round-trips (STATUS? reflects lomode + loslots)
+[ ] LOWBATT with no state / bad slots / extra tokens -> ERR ARGS
+[ ] LOWBATT on without a count defaults to 1 slot; on with a big number
+    clamps to FM_SKIP_SLOTS_MAX (48)
+[ ] LOWBATT requires key material: on an unpaired device -> ERR UNPAIRED
+[ ] lomode + loslots persist across a reset (NVS)
+[ ] one active slot is followed by a deep sleep of n slot-lengths: the PWR
+    log shows a run of light cycles, then silence of n*rot_sec, then
+    "resumed key chain at slot k" -> slot k+n (one P-224 on wake)
+[ ] during the deep-sleep gap the console is silent and the MAC is absent
+    from scans (TB verify finds nothing until the device wakes)
+[ ] slot alignment is preserved: advance is 1+n per active+sleep pair, so
+    TB sync after a gap matches the device counter (no drift)
+[ ] skipped slots never derive a P-224 key (the wake catch-up is SHA-256
+    only); the status byte carries FM_STATUS_LOWBATT (0x04)
 
 --------------------------------------------------------------------------------
 6. BLE BEACON - SYNC FROM THE AIR
@@ -218,6 +239,12 @@ Manual / ad-hoc (open a console session with TB unlock --reset, then):
 8. TOOLBOX UTILITIES (every subcommand)
 --------------------------------------------------------------------------------
 [ ] TB devices            -> table: id, port, slot, adv, rot, dbg, paired, pin
+[ ] TB status              -> prints paired, slot, debug, adv_ms, rot_sec,
+                              dbg_sec, lomode, loslots from STATUS? (--reset
+                              wakes a deep-sleeping beacon first)
+[ ] TB lowbatt on / off / on <n> -> reflected in STATUS? + devices lb column
+[ ] TB pair --lomode 1     -> enables low-battery mode during pairing (also
+                              prompted on a TTY)
 [ ] TB pair               -> refuses an existing id without --force (rc 1)
 [ ] TB pair --force       -> new keys, KEY? cross-checked against findmy,
                              fresh PIN printed and stored, slot 0
@@ -254,10 +281,14 @@ Manual / ad-hoc (open a console session with TB unlock --reset, then):
 9. DOCUMENTATION
 --------------------------------------------------------------------------------
 [ ] docs/uart-protocol.md matches fw=3 behaviour (lock, PIN, lockout, WIPE
-    without argument, status bitfield, ERR table)
+    without argument, status bitfield incl. FM_STATUS_LOWBATT, ERR table,
+    LOWBATT command, STATUS? lomode/loslots)
 [ ] docs/firmware.md: state machine, config mode, NVS keys pin/pinfails,
-    FM_PIN_* constants, status byte row
-[ ] docs/power.md, docs/roadmap.md: no references to removed scripts
+    FM_PIN_* constants, status byte row, low-battery mode (deep-sleep slot
+    skip + batch catch-up), NVS lomode/loslots
+[ ] docs/power.md documents the low-battery deep-sleep cycle; docs/roadmap.md
+    lists low-battery + status in "Done in this pass"; no references to
+    removed scripts
 [ ] no file references flash_esp32.sh (removed) and no doc says the toolbox
     needs ESP-IDF (it needs only: pip install -r requirements.txt)
 [ ] Scripts/README.md describes the toolbox only; root README.md commands
@@ -269,19 +300,22 @@ Manual / ad-hoc (open a console session with TB unlock --reset, then):
   1. python3 -m py_compile Scripts/findmy-toolbox.py
   2. (IDF) idf.py build && idf.py -p /dev/ttyACM0 flash
   3. Scripts/findmy-toolbox.py devices
-  4. Scripts/findmy-toolbox.py test              # 79 checks, resets device
-  5. Scripts/findmy-toolbox.py connect && Scripts/findmy-toolbox.py disconnect
-  6. Scripts/findmy-toolbox.py reset
-  7. Scripts/findmy-toolbox.py pair --force
-  8. Scripts/findmy-toolbox.py sync && Scripts/findmy-toolbox.py sync-ble
-  9. Scripts/findmy-toolbox.py verify 15 && Scripts/findmy-toolbox.py scan 15
- 10. Scripts/findmy-toolbox.py power --dbg-sec 60 --seconds 45
- 11. Scripts/findmy-toolbox.py unlock --reset && Scripts/findmy-toolbox.py lock
- 12. Scripts/findmy-toolbox.py retrieve   (then --doctor / --bg / --status /
+  4. Scripts/findmy-toolbox.py test              # 83 checks, resets device
+  5. Scripts/findmy-toolbox.py status && Scripts/findmy-toolbox.py lowbatt \
+     on 1 && Scripts/findmy-toolbox.py status && Scripts/findmy-toolbox.py \
+     lowbatt off
+  6. Scripts/findmy-toolbox.py connect && Scripts/findmy-toolbox.py disconnect
+  7. Scripts/findmy-toolbox.py reset
+  8. Scripts/findmy-toolbox.py pair --force
+  9. Scripts/findmy-toolbox.py sync && Scripts/findmy-toolbox.py sync-ble
+ 10. Scripts/findmy-toolbox.py verify 15 && Scripts/findmy-toolbox.py scan 15
+ 11. Scripts/findmy-toolbox.py power --dbg-sec 60 --seconds 45
+ 12. Scripts/findmy-toolbox.py unlock --reset && Scripts/findmy-toolbox.py lock
+ 13. Scripts/findmy-toolbox.py retrieve   (then --doctor / --bg / --status /
      --follow / --stop) and: apple-id status / connect / disconnect --yes
- 13. Scripts/findmy-toolbox.py monitor --once
- 14. Scripts/findmy-toolbox.py log --lines 20
- 15. grep -c "<current PIN>" Scripts/state/toolbox.log   # must be 0
+ 14. Scripts/findmy-toolbox.py monitor --once
+ 15. Scripts/findmy-toolbox.py log --lines 20
+ 16. grep -c "<current PIN>" Scripts/state/toolbox.log   # must be 0
 
 Known limitations (by design):
   - reports stay at 0 until a locked iPhone is near the beacon
