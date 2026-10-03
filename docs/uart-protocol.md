@@ -5,7 +5,14 @@ USB bridge as `/dev/ttyACM0`. Implemented in
 `ESP32/main/uart_cmd.c`, mirrored by
 `Scripts/findmy-toolbox.py` (`Beacon.cmd()`).
 
-Protocol version: **`PONG fw=3`**.
+Protocol version: **`PONG fw=4`**.
+
+`fw=4` adds OS-reported status bits (battery/power/user/net), a whole-byte
+even-parity bit, the `OS?`/`OSSTATE`/`OSMODE` status commands, and the
+ESP32-initiated `OS?` poll by which the beacon fetches OS state during the
+debug session and at each active-slot boundary in the steady state. The old
+toolbox-only `LOWBATT` command remains on the device but is no longer used by
+the toolbox (low-battery is OS-driven).
 
 ## Console lock
 
@@ -68,7 +75,7 @@ locked.
 Replies are single lines without a log prefix:
 
 ```
-PONG fw=3 paired=1
+PONG fw=4 paired=1
 OK UNLOCK
 OK LOCK
 OK KEYS
@@ -78,6 +85,9 @@ ERR PIN
 ERR LOCK 30
 STAT paired=1 slot=4 debug=0
 STATUS paired=1 slot=4 debug=0 adv_ms=2000 rot_sec=120 dbg_sec=600
+OS batt=0 power=1 user=1 net=0
+OK OSSTATE batt=0 power=1 user=1 net=0
+OK OSMODE poll
 ```
 
 Log output (`I (1234) uart_cmd: ...`) is interleaved on the same stream, so
@@ -121,7 +131,7 @@ suite flaky before the cache existed.
 
 ### PING
 ```
-PING [anything]   -> PONG fw=3 paired=<0|1> | LOCKED
+PING [anything]   -> PONG fw=4 paired=<0|1> | LOCKED
 ```
 Always answered when unlocked, even with trailing garbage. Used as the
 liveness probe. `paired=` reports the key store, not the lock state.
@@ -240,13 +250,66 @@ P-224) and derives the current slot's P-224 public key exactly once, so
 skipped slots never cost a key derivation. The status byte reflects the
 mode (`FM_STATUS_LOWBATT`). Takes effect at the end of the current slot.
 
+### OS? / OSSTATE / OSMODE (fw=4)
+
+```
+OS?                  -> OS batt=<0|1> power=<0|1> user=<0|1> net=<0|1>
+OSSTATE <b> <p> <u> <n> -> OK OSSTATE batt=.. power=.. user=.. net=..
+OSMODE [direct|poll] -> OSMODE <direct|poll> | OK OSMODE <direct|poll>
+```
+
+`OS?` reports the currently latched OS status bits and is answered **even
+while the console is locked** (like `IDENT?` — it carries no secret).
+`OSSTATE` sets all four OS bits directly (battery is persisted to NVS, the
+rest are RAM-only) and needs an unlocked console. Each argument is an
+individual `0`/`1`; a fifth token or any out-of-range value is `ERR ARGS`.
+
+`OSMODE` selects how the OS bits are fed:
+- `direct` — the bits come only from `OSSTATE` (no firmware-initiated poll).
+- `poll` (default) — the beacon sends `OS?\n` and latches the `OK OS …`
+  reply it gets back.
+
+### The OS? poll (beacon → OS daemon)
+
+The beacon is the *client* here: to keep the OS status fresh it writes a bare
+`OS?\n` to the UART and expects a single-line reply from the host:
+
+```
+OS?\n        (beacon -> host)
+OK OS batt=0 power=1 user=1 net=0\n    (host -> beacon)
+```
+
+The reply carries only the OS-owned bits (2–5). The beacon keeps bits 0/1
+(its own lock/config state) and bit 6 (parity), so the OS can never spoof
+them. A missing/timed-out reply clears power/login/net (the OS is off or the
+daemon is gone); battery is left as persisted so a gone daemon cannot
+silently re-arm cycle-skip.
+
+**Timing.** In the *debug session* the poll runs on an idle timer
+(`FM_DEBUG_POLL_MS` = 5 s by default) so a host can watch it live. In the
+*steady state* it fires once per **active** slot boundary. On a normal slot
+end the `OS?` is sent before the ~2.2 s P-224 key derivation and read when
+the derivation finishes, so the round-trip adds **no extra awake time**; in
+low-battery skip mode there is no derivation to overlap, so the beacon sends
+`OS?` and waits the short reply before deep-sleeping the skipped slots.
+Skipped (deep-sleep) slots never poll, which gives the OS daemon a whole
+slot to notice `/dev/ttyACM0` has re-appeared and reconnect.
+
+**Daemon contract.** The OS-side responder (a small C daemon, not built yet)
+owns `/dev/ttyACM0` during the steady state, answers `OS?\n`, and tolerates
+the device dropping off USB during deep sleep (it must re-open the port when
+it re-enumerates). It must ignore every line that is not `OS?` so it never
+steps on the human console. Ownership: the toolbox pauses the daemon while a
+console session is open.
+
 ### STAT? / STATUS?
 ```
 STAT?    -> STAT paired=<0|1> slot=<n> debug=<0|1>
 STATUS?  -> STATUS paired=.. slot=.. debug=.. adv_ms=.. rot_sec=.. dbg_sec=..
                  lomode=<0|1> loslots=..
 ```
-Both are answered even when unpaired (`slot=0`).
+Both are answered even when unpaired (`slot=0`). `lomode`/`loslots` reflect
+the OS-set battery flag (bit 2) and its skip count.
 
 ## Error replies
 
@@ -271,11 +334,20 @@ rebuild payload → start; a no-op when advertising is not running):
 
 | Bit | Mask | Meaning |
 |---|---|---|
-| 0 | `FM_STATUS_UNLOCKED` | console unlocked |
-| 1 | `FM_STATUS_CONFIG` | config mode (unpaired **or** factory PIN) |
-| 2 | `FM_STATUS_LOWBATT` | low-battery mode (skipping slots) |
+| 0 | `FM_STATUS_UNLOCKED` | console unlocked (ESP32) |
+| 1 | `FM_STATUS_CONFIG` | config mode, never sleeps (ESP32) |
+| 2 | `FM_STATUS_LOWBATT` | OS reports battery < 20% (persisted; skips slots) |
+| 3 | `FM_STATUS_POWER` | OS powered on |
+| 4 | `FM_STATUS_LOGIN` | a user is logged in |
+| 5 | `FM_STATUS_NET` | OS has internet access |
+| 6 | `FM_STATUS_PARITY` | **even parity over the whole byte** |
+| 7 | — | spare (always 0) |
 
-The byte itself is still written at `adv_data[6]`.
+Bits 3–5 are latched from `OS?` poll replies (poll mode) or set directly with
+`OSSTATE` (direct mode); bit 2 is persisted in NVS and also drives the
+skip-slot mechanism. The parity bit (6) is computed so the byte has an even
+number of set bits; a receiver that recomputes parity can detect a corrupted
+or mis-trancsmitted byte. The byte itself is still written at `adv_data[6]`.
 
 ## Example session (first pairing)
 
@@ -285,7 +357,7 @@ LOCKED
 > UNLOCK 00000000
 OK UNLOCK
 > PING
-PONG fw=3 paired=0
+PONG fw=4 paired=0
 > KEYS dGVzdC1tYXN0ZXIta2V5AAAAAAA= dGVzdC1za24AAAA... 2000 120 600
 OK KEYS
 > PIN 12345678

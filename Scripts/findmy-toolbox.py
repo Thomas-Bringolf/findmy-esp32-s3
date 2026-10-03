@@ -81,13 +81,19 @@ PIN_FAIL_MAX = 5           # firmware FM_PIN_FAIL_MAX (before a lockout)
 NAME_LEN = 16              # firmware FM_NAME_LEN
 
 MARKERS = ("PONG", "OK ", "ERR", "SLOT ", "KEY ", "STAT ", "STATUS ",
-           "IDENT ", "LOCKED")
+           "IDENT ", "LOCKED", "OS batt=", "OSMODE ")
 
 # Process-wide console connection state: what 'connect' identified, so the
 # menu can offer the UART commands that need a known device. Every command
 # still opens its own session; nothing is held open between menu steps.
 CONNECTED: dict | None = None
 LOG_PREFIX = re.compile(r"^[IVDEW] \(\d+\) [^:]+: ")
+
+# The toolbox's fake-OS bit config: what it reports when the ESP32 sends an
+# OS? poll (this is a test doubles the real daemon). Set via the Debug status
+# submenu; 0/False for every bit until then. Mirrors findmy-toolbox's role as
+# a stand-in that answers OS? polls with these values.
+_FAKE_OS = {"batt": 0, "power": 0, "user": 0, "net": 0}
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -110,7 +116,7 @@ CHANNEL_COLOR = {
     "MAIN": WHITE, "UI": CYAN, "PAIR": GREEN, "SYNC": BLUE,
     "SYNC-BLE": BLUE, "KEYGEN": YELLOW, "RETRIEVE": MAGENTA, "TEST": WHITE,
     "POWER": YELLOW, "VERIFY": GREEN, "SCAN": BLUE, "MONITOR": CYAN,
-    "LOWBATT": YELLOW, "WORKER": MAGENTA, "ERROR": RED,
+    "WORKER": MAGENTA, "ERROR": RED,
 }
 
 LOG_COLOR = sys.stderr.isatty() and "NO_COLOR" not in os.environ
@@ -421,8 +427,7 @@ def save_entry(entry: dict) -> None:
 
 def fresh_device_entry(dev_id: str, port: str, master: bytes, skn: bytes,
                        paired_at: datetime, pin: str, adv_ms: int,
-                       rot_sec: int, dbg_sec: int, *,
-                       lomode: int = 0, loslots: int = 0) -> dict:
+                       rot_sec: int, dbg_sec: int) -> dict:
     b64 = lambda x: base64.b64encode(x).decode()
     return {
         "id": dev_id,
@@ -436,8 +441,6 @@ def fresh_device_entry(dev_id: str, port: str, master: bytes, skn: bytes,
         "adv_ms": adv_ms,
         "rot_sec": rot_sec,
         "dbg_sec": dbg_sec,
-        "lomode": lomode,
-        "loslots": loslots,
         "pin": pin,
     }
 
@@ -517,7 +520,9 @@ OF_LEN = 0x19
 OF_HEADER = 2
 APPLE_MFR = 0x004C
 OF_MFR_LEN = OF_HEADER + OF_LEN
-STATUS_BITS = 0x07  # FM_STATUS_UNLOCKED | FM_STATUS_CONFIG | FM_STATUS_LOWBATT
+# Every defined status bit (0-6); bit7 is the unused spare. fm_status_with_parity
+# keeps bit6 as even parity over the whole byte, so it is a defined bit too.
+STATUS_BITS = 0x7F
 
 
 def legacy_mac(key) -> str:
@@ -597,8 +602,11 @@ def frame_spec_checks(mac: str, mfr: bytes) -> list[tuple[str, bool, str]]:
         add("random static address: top two bits are 0b11",
             first & 0xC0 == 0xC0, f"first octet {first:#04x}")
     if len(mfr) == OF_MFR_LEN:
-        add("status byte uses only defined bits (0x07)",
+        add("status byte uses only defined bits (0x7F)",
             mfr[2] & ~STATUS_BITS == 0, f"status {status_decode(mfr[2])}")
+        add("status byte parity OK (even over the byte)",
+            status_parity_ok(mfr[2]),
+            f"status {status_decode(mfr[2])} parity bad")
         add("hint byte is 0x00", mfr[26] == 0, f"hint {mfr[26]:#04x}")
     return checks
 
@@ -639,12 +647,24 @@ def key_spec_checks(mac: str, mfr: bytes, key, dev_id: str,
     return checks
 
 
+def status_parity_ok(status_byte: int) -> bool:
+    """Even parity over the whole status byte (matches the firmware's bit 6)."""
+    return (bin(status_byte).count("1") & 1) == 0
+
+
 def status_decode(status_byte: int) -> str:
     bits = []
     bits.append("UNLOCKED" if status_byte & 0x01 else "locked")
     bits.append("CONFIG" if status_byte & 0x02 else "sleep-cycle")
     if status_byte & 0x04:
-        bits.append("lowbatt")
+        bits.append("batt")
+    if status_byte & 0x08:
+        bits.append("power")
+    if status_byte & 0x10:
+        bits.append("user")
+    if status_byte & 0x20:
+        bits.append("net")
+    bits.append("parity=" + ("ok" if status_parity_ok(status_byte) else "BAD"))
     return f"0x{status_byte:02x} ({'+'.join(bits)})"
 
 
@@ -657,6 +677,19 @@ def status_color(status_byte: int | None) -> str:
     if status_byte & 0x01:
         return YELLOW
     return GREEN
+
+
+def _bit_color(name: str, value: bool) -> str:
+    """Per-status-bit colour for the monitor table."""
+    if not value:
+        return GREEN
+    if name == "config":
+        return RED
+    if name == "batt":
+        return MAGENTA
+    if name == "unlocked":
+        return YELLOW
+    return CYAN  # power/user/net
 
 
 def report_status(d: dict) -> tuple[int | None, str]:
@@ -681,7 +714,10 @@ def status_summary(reports: list[dict]) -> dict | None:
 
 STATUS_BIT_NAMES = ((0x01, "unlocked"),
                     (0x02, "config"),
-                    (0x04, "lowbatt"))
+                    (0x04, "batt"),
+                    (0x08, "power"),
+                    (0x10, "user"),
+                    (0x20, "net"))
 
 
 def status_bit_history(reports: list[dict], now) -> list[dict]:
@@ -877,6 +913,12 @@ class Beacon:
             if "Guru Meditation" in raw or raw.startswith("Backtrace:"):
                 log(self.channel, f"device crashed: {raw.strip()}",
                     logging.ERROR)
+            if raw.strip() == "OS?":
+                self.s.write(self._os_fake_reply())
+                self.s.flush()
+                log(self.channel, "< auto-answered OS? poll with fake bits",
+                    logging.DEBUG)
+                continue
             reply = reply_of(raw)
             if reply is not None:
                 log(self.channel, f"< {reply}", logging.DEBUG)
@@ -885,6 +927,34 @@ class Beacon:
             f"< (no reply to {line.strip() or '<empty>'} in {wait:g}s)",
             logging.DEBUG)
         return "TIMEOUT"
+
+    def _os_fake_reply(self) -> bytes:
+        f = _FAKE_OS
+        return (f"OK OS batt={f['batt']} power={f['power']} "
+                f"user={f['user']} net={f['net']}\r\n").encode()
+
+    def respond_to_next_poll(self, timeout: float = 12.0) -> bool:
+        """Block until the ESP32 sends an OS? poll, answer it with the current
+        fake-OS bits, and return True. False on timeout (device not polling,
+        e.g. still in direct mode or asleep)."""
+        prev = self.s.timeout
+        self.s.timeout = 0.05
+        try:
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                raw = self.s.readline().decode(errors="replace")
+                if "Guru Meditation" in raw or raw.startswith("Backtrace:"):
+                    log(self.channel, f"device crashed: {raw.strip()}",
+                        logging.ERROR)
+                if raw.strip() == "OS?":
+                    self.s.write(self._os_fake_reply())
+                    self.s.flush()
+                    log(self.channel, "< auto-answered OS? poll with fake bits",
+                        logging.DEBUG)
+                    return True
+        finally:
+            self.s.timeout = prev
+        return False
 
     def alive(self) -> bool:
         reply = self.cmd("PING", wait=1.5)
@@ -982,15 +1052,13 @@ def cmd_devices(args) -> int:
         ui(f"no devices in {DEVICES_JSON}")
         return 0
     header = (f"{'id':<20} {'port':<14} {'slot':>5} {'adv':>6} {'rot':>6} "
-              f"{'dbg':>5} {'lb':>4}  {'paired':<20} pin")
+              f"{'dbg':>5}  {'paired':<20} pin")
     ui(header, MAGENTA + BOLD)
     for d in devices:
-        lb = ("-" if not d.get("lomode")
-              else f"{d.get('loslots', 1)}")
         ui(f"{d['id']:<20} {d.get('port', '?'):<14} "
            f"{str(d.get('last_known_slot', '?')):>5} "
            f"{str(d.get('adv_ms', '?')):>6} {str(d.get('rot_sec', '?')):>6} "
-           f"{str(d.get('dbg_sec', '?')):>5} {lb:>4}  "
+           f"{str(d.get('dbg_sec', '?')):>5}  "
            f"{d.get('paired_at', '?'):<20} {device_pin(d)}")
     log("MAIN", f"{len(devices)} device(s) in {DEVICES_JSON.name}")
     return 0
@@ -1035,11 +1103,6 @@ def cmd_pair(args) -> int:
     else:
         dbg_sec = (prompt_int("console countdown in s", 600, 60, 3600, (0,))
                    if ask else 600)
-    if args.lomode is not None:
-        lomode = args.lomode
-    else:
-        lomode = (prompt_int("low-battery: slots to skip per active slot "
-                             "(0 = off)", 0, 0, 48) if ask else 0)
 
     # From a connection the console stays open (the menu keeps working on
     # it); a plain CLI run locks the device again when it is done.
@@ -1090,20 +1153,8 @@ def cmd_pair(args) -> int:
             raise UserError(f"PIN change refused: {reply}")
         beacon.pin = new_pin
 
-        loslots = 0
-        if lomode and lomode > 0:
-            reply = beacon.cmd(f"LOWBATT on {lomode}")
-            if not reply.startswith("OK LOWBATT"):
-                raise UserError(f"low-battery mode refused: {reply}")
-            m = re.search(r"loslots=(\d+)", reply)
-            loslots = int(m.group(1)) if m else lomode
-        else:
-            beacon.cmd("LOWBATT off")
-
         save_entry(fresh_device_entry(dev_id, port, master, skn, paired_at,
-                                      new_pin, adv_ms, rot_sec, dbg_sec,
-                                      lomode=1 if lomode and lomode > 0 else 0,
-                                      loslots=loslots))
+                                      new_pin, adv_ms, rot_sec, dbg_sec))
         if CONNECTED is not None and CONNECTED.get("port") == port:
             CONNECTED.update({"id": dev_id, "name": dev_id, "paired": True,
                               "pin": new_pin})
@@ -1115,8 +1166,6 @@ def cmd_pair(args) -> int:
     ui(f"  slot 0 X : {got}")
     ui(f"  timings  : adv_ms={adv_ms} rot_sec={rot_sec} dbg_sec={dbg_sec}")
     ui(f"  PIN      : {paint(GREEN, new_pin, ui=True)}")
-    if loslots:
-        ui(f"  lowbatt  : on ({loslots} slot(s) skipped per active slot)")
     ui(f"  stored   : {DEVICES_JSON}")
     return 0
 
@@ -1162,39 +1211,105 @@ def cmd_sync(args) -> int:
     return 0
 
 
-def cmd_lowbatt(args) -> int:
-    channel = "LOWBATT"
+def _os_channel() -> str:
+    return "STATUS-DEBUG"
+
+
+def cmd_status_debug(args) -> int:
+    """Interactive Debug > Status submenu: toggle the 4 OS status bits
+    (batt/power/user/net) with [x] checkboxes, then write them to the ESP32
+    either by push (OSSTATE, immediate) or by letting the ESP32 poll them
+    (we answer its OS? with the selected bits). Bits 0/1 (unlocked/config)
+    and bit6 (parity) are ESP32-owned and are never offered here."""
+    p = lambda color, text: paint(color, text, ui=True)
+    channel = _os_channel()
     data = load_devices()
     dev_id = pick_device(data, args.id)
     device = find_device(data, dev_id)
     port = resolve_port(args.port, device)
     pin = unlock_pin_for(device, args.pin)
 
-    on = args.state.lower() in ("on", "1", "y", "yes")
-    cmd = "LOWBATT on" if on else "LOWBATT off"
-    if on and args.slots:
-        cmd += f" {int(args.slots)}"
+    bits = {"batt": 0, "power": 0, "user": 0, "net": 0}
+    order = ("batt", "power", "user", "net")
 
-    log(channel, f"'{dev_id}': {cmd}")
+    def show() -> None:
+        print("\n  Status bit debug (ESP32-owned bits 0/1 and parity are not "
+              "exposed)")
+        for i, name in enumerate(order, 1):
+            mark = "[x]" if bits[name] else "[ ]"
+            print(f"   {i}) {mark} {name}")
+        print("   w) write to the beacon")
+        print("   q) cancel / back")
+
+    show()
+    try:
+        while True:
+            raw = input(p(BOLD, "> ")).strip().lower()
+            if raw in ("q", "quit", "back", "0"):
+                print(p(DIM, "  (cancelled - nothing written)"))
+                return 0
+            if raw in ("w", "write"):
+                break
+            if raw.isdigit():
+                n = int(raw)
+                if 1 <= n <= len(order):
+                    name = order[n - 1]
+                    bits[name] = 1 - bits[name]
+                    show()
+                    continue
+            for name in order:
+                if raw == name:
+                    bits[name] = 1 - bits[name]
+                    show()
+                    break
+            else:
+                print(p(YELLOW, "  pick a bit (1-4), 'w' to write, 'q' to quit"))
+    except (EOFError, KeyboardInterrupt):
+        sys.stdout.write(RESET + "\n")
+        return 0
+
+    try:
+        write = input(p(BOLD, "  write method: [p]ush or [o]s-poll? "))
+        write = write.strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        sys.stdout.write(RESET + "\n")
+        return 0
+    want_poll = write in ("o", "os", "poll", "os-poll")
+
     beacon = Beacon(port, pin, dev_id=dev_id, channel=channel,
                     pin_from_flag=args.pin is not None)
     try:
         beacon.after_open(reset=args.reset)
-        reply = beacon.cmd(cmd)
-        if not reply.startswith("OK LOWBATT"):
-            raise UserError(reply)
-        loslots = 0
-        m = re.search(r"loslots=(\d+)", reply)
-        if m:
-            loslots = int(m.group(1))
-        device["lomode"] = 1 if on else 0
-        device["loslots"] = loslots if on else 0
-        save_devices(data)
+        if want_poll:
+            # The ESP32 latches these bits from its OS? polls, so we take over
+            # the fake-daemon role and answer the next poll with them.
+            _FAKE_OS.update(bits)
+            beacon.cmd("OSMODE poll")
+            ui("  waiting for the ESP32's next OS? poll to answer with the "
+               "selected bits...")
+            if not beacon.respond_to_next_poll(timeout=12.0):
+                raise UserError("no OS? poll within 12 s - is the firmware in "
+                                "poll mode and paired?")
+            got = beacon.cmd("OS?")
+            m = re.search(r"batt=(\d+) power=(\d+) user=(\d+) net=(\d+)", got)
+            if not m:
+                raise UserError(f"could not read the latched OS state: {got}")
+            latched = {"batt": int(m.group(1)), "power": int(m.group(2)),
+                       "user": int(m.group(3)), "net": int(m.group(4))}
+            log(channel, f"poll-latched OS bits: {latched}")
+            ui(f"  ESP32 latched OS bits: {latched}")
+            return 0
+        # push: send OSSTATE directly to the ESP32
+        beacon.cmd("OSMODE direct")
+        reply = beacon.cmd(f"OSSTATE {bits['batt']} {bits['power']} "
+                           f"{bits['user']} {bits['net']}")
+        if not reply.startswith("OK OSSTATE"):
+            raise UserError(f"OSSTATE refused: {reply}")
+        _FAKE_OS.update(bits)
+        log(channel, f"pushed OS bits: {bits} -> {reply}")
+        ui(f"  pushed OS bits to the beacon: {bits}")
     finally:
         beacon.close()
-
-    ui(f"low-battery mode {'on' if on else 'off'} "
-       f"({loslots} slot(s) skipped per active slot)")
     return 0
 
 
@@ -1215,6 +1330,7 @@ def cmd_status(args) -> int:
         reply = beacon.cmd("STATUS?")
         if not reply.startswith("STATUS "):
             raise UserError(reply)
+        os_reply = beacon.cmd("OS?")
     finally:
         beacon.close()
 
@@ -1231,12 +1347,16 @@ def cmd_status(args) -> int:
     ui(f"  {'advertisement period (adv_ms)':<32} {kv.get('adv_ms', '?')} ms")
     ui(f"  {'key rotation period (rot_sec)':<32} {kv.get('rot_sec', '?')} s")
     ui(f"  {'console countdown (dbg_sec)':<32} {kv.get('dbg_sec', '?')} s")
-    lb_on = kv.get("lomode") == "1"
-    lb_value = "off"
-    if lb_on:
-        lb_value = (f"on, {kv.get('loslots', '?')} slot(s) skipped "
-                    "per active slot")
-    ui(f"  {'low-battery mode':<32} {lb_value}")
+    ui("")
+    om = re.search(r"batt=(\d) power=(\d) user=(\d) net=(\d)", os_reply)
+    if om:
+        ui("  OS status bits (latched / reported):", DIM)
+        for name, val in (("battery<20%", om.group(1)), ("powered on",
+                          om.group(2)), ("user logged in", om.group(3)),
+                          ("internet up", om.group(4))):
+            ui(f"  {'  ' + name:<32} {'on' if val == '1' else 'off'}")
+    else:
+        ui(f"  OS status bits: (no OS? reply: {os_reply})", DIM)
     ui("")
     return 0
 
@@ -1493,7 +1613,7 @@ def cmd_test(args) -> int:
 
         suite.step("P1: protocol and malformed input")
         reply = beacon.cmd("PING")
-        suite.check("PING -> PONG fw=3", reply.startswith("PONG fw=3"), reply)
+        suite.check("PING -> PONG fw=4", reply.startswith("PONG fw=4"), reply)
         suite.check("STAT?", beacon.cmd("STAT?").startswith("STAT paired="),
                     beacon.cmd("STAT?"))
         suite.check("STATUS?", beacon.cmd("STATUS?").startswith("STATUS paired="),
@@ -1564,28 +1684,42 @@ def cmd_test(args) -> int:
                     reply.startswith("OK CONFIG adv_ms=2000 rot_sec=120 dbg_sec=600"),
                     reply)
 
-        suite.step("P1b: low-battery mode")
-        reply = beacon.cmd("LOWBATT")
-        suite.check("LOWBATT no args -> ERR ARGS",
+        suite.step("P1b: OS status bits")
+        reply = beacon.cmd("OS?")
+        suite.check("OS? getter -> OS batt=.. power=.. user=.. net=..",
+                    re.match(r"OS batt=\d power=\d user=\d net=\d", reply)
+                    is not None, reply)
+        reply = beacon.cmd("OSMODE junk")
+        suite.check("OSMODE bad value -> ERR ARGS",
                     reply.startswith("ERR ARGS"), reply)
-        reply = beacon.cmd("LOWBATT maybe 1")
-        suite.check("LOWBATT bad state -> ERR ARGS",
+        reply = beacon.cmd("OSMODE")
+        suite.check("OSMODE with no arg reports current mode",
+                    reply.startswith("OSMODE "), reply)
+        reply = beacon.cmd("OSMODE direct")
+        suite.check("OSMODE direct -> OK OSMODE direct",
+                    reply == "OK OSMODE direct", reply)
+        reply = beacon.cmd("OSSTATE 1 0 1 0")
+        suite.check("OSSTATE pushes OS bits",
+                    reply.startswith("OK OSSTATE batt=1 power=0 user=1 net=0"),
+                    reply)
+        reply = beacon.cmd("OSSTATE 1 1 1 1")
+        suite.check("OSSTATE all on", "batt=1 power=1 user=1 net=1" in reply,
+                    reply)
+        reply = beacon.cmd("OSSTATE 2 0 0 0")
+        suite.check("OSSTATE batt out of range -> ERR ARGS",
                     reply.startswith("ERR ARGS"), reply)
-        reply = beacon.cmd("LOWBATT on x")
-        suite.check("LOWBATT bad slots -> ERR ARGS",
+        reply = beacon.cmd("OSSTATE 0 1")
+        suite.check("OSSTATE too few args -> ERR ARGS",
                     reply.startswith("ERR ARGS"), reply)
-        reply = beacon.cmd("LOWBATT on 999999")
-        suite.check("LOWBATT slots clamp to max", "loslots=48" in reply, reply)
-        reply = beacon.cmd("LOWBATT off")
-        suite.check("LOWBATT off", reply.startswith("OK LOWBATT off"), reply)
-        reply = beacon.cmd("LOWBATT on")
-        suite.check("LOWBATT on defaults to 1", "loslots=1" in reply, reply)
-        status = beacon.cmd("STATUS?")
-        suite.check("STATUS? reflects lomode",
-                    "lomode=1 loslots=1" in status, status)
-        reply = beacon.cmd("LOWBATT off")
-        suite.check("LOWBATT back off",
-                    reply.startswith("OK LOWBATT off"), reply)
+        reply = beacon.cmd("OSSTATE 0 1 0 1 trailing")
+        suite.check("OSSTATE extra arg -> ERR ARGS",
+                    reply.startswith("ERR ARGS"), reply)
+        reply = beacon.cmd("OSMODE poll")
+        suite.check("OSMODE poll -> OK OSMODE poll",
+                    reply == "OK OSMODE poll", reply)
+        reply = beacon.cmd("OSSTATE 0 0 0 0")
+        suite.check("OSSTATE back to all off",
+                    reply.startswith("OK OSSTATE"), reply)
 
         suite.step("P2: PIN rotation and lock round-trip")
         reply = beacon.cmd("PIN 12ab3456")
@@ -1717,12 +1851,25 @@ def cmd_test(args) -> int:
             raise
         reply = beacon.cmd("STATUS?")
         suite.check("countdown setting survived", "dbg_sec=60" in reply, reply)
-        reply = beacon.cmd("LOWBATT on 2")
-        suite.check("LOWBATT on 2 persisted past the reset",
-                    "loslots=2" in reply, reply)
-        reply = beacon.cmd("LOWBATT off")
-        suite.check("LOWBATT cleared again",
-                    reply.startswith("OK LOWBATT off"), reply)
+        reply = beacon.cmd("OSSTATE 1 0 0 0")
+        suite.check("OSSTATE battery bit can be set",
+                    reply.startswith("OK OSSTATE batt=1"), reply)
+        reply = beacon.cmd("OS?")
+        suite.check("latched OS state reports battery after being set",
+                    "batt=1" in reply, reply)
+        resetb = open_beacon(port, pin_final, unlock=False, reset=True,
+                             ready_timeout=30, dev_id=dev_id)
+        try:
+            # OS? is the one status getter answered while locked.
+            bbit = resetb.cmd("OS?")
+            suite.check("OS battery bit persisted past a reset",
+                        "batt=1" in bbit, bbit)
+            resetb.unlock(pin_final)  # OSSTATE needs an unlocked console
+            resetb.cmd("OSSTATE 0 0 0 0")
+            suite.check("OS battery bit cleared again",
+                        "batt=0" in resetb.cmd("OS?"), resetb.cmd("OS?"))
+        finally:
+            resetb.close()
         reply = beacon.cmd("CONFIG 2000 120 600")
         suite.check("defaults restored",
                     reply.startswith("OK CONFIG adv_ms=2000 rot_sec=120 dbg_sec=600"),
@@ -1934,6 +2081,7 @@ def report_to_dict(r, slot: int, key) -> dict:
         "confidence": r.confidence,
         "status": r.status,
         "status_text": status_decode(r.status),
+        "status_parity": "ok" if status_parity_ok(r.status) else "bad",
         "key_hash": key.hashed_adv_key_b64,
     }
 
@@ -2642,15 +2790,15 @@ def render_monitor(device_id: str | None) -> str:
                 except (TypeError, ValueError, OverflowError):
                     pass
             raw_status = st.get("status")
+            _ok = raw_status is None or status_parity_ok(raw_status)
             out.append("  " + p(BOLD, "STATUS") + "  " +
                        p(status_color(raw_status) + BOLD,
                          st.get("text") or "?") + "  " +
                        p(DIM, f"slot {st.get('slot', '?')}, "
-                              f"report {age_str} ago"))
+                              f"report {age_str} ago") +
+                       ("  " + p(RED + BOLD, "PARITY ERROR") if not _ok else ""))
             for row in status_bit_history(reports, now):
-                col = GREEN if not row["value"] else (
-                    MAGENTA if row["name"] == "lowbatt"
-                    else (RED if row["name"] == "config" else YELLOW))
+                col = _bit_color(row["name"], row["value"])
                 label = ("ON " if row["value"] else "off") + f" {row['name']}"
                 if row["seconds"] is None:
                     hold = "no data"
@@ -3623,7 +3771,7 @@ COMMANDS = {
     "apple-id": cmd_apple,
     "sync": cmd_sync,
     "sync-ble": cmd_sync_ble,
-    "lowbatt": cmd_lowbatt,
+    "status-debug": cmd_status_debug,
     "status": cmd_status,
     "devices": cmd_devices,
     "test": cmd_test,
@@ -3644,8 +3792,8 @@ COMMANDS = {
 COMMAND_CHANNEL = {
     "pair": "PAIR", "connect": "CONNECT", "disconnect": "MAIN",
     "reset": "MAIN", "apple-id": "APPLE", "sync": "SYNC", "sync-ble": "SYNC-BLE",
+    "status-debug": "STATUS-DEBUG", "status": "MAIN",
     "devices": "MAIN", "test": "TEST", "power": "POWER", "retrieve": "RETRIEVE",
-    "lowbatt": "LOWBATT", "status": "MAIN",
     "watch": "RETRIEVE", "monitor": "MONITOR", "verify": "VERIFY", "scan": "SCAN",
     "pin": "MAIN", "unlock": "MAIN", "lock": "MAIN", "wipe": "MAIN",
     "log": "MAIN", "help": "UI",
@@ -3659,8 +3807,6 @@ MENU_GROUPS = [
     ("monitoring", CYAN, [
         ("devices", "list paired devices", ["devices"], None),
         ("retrieve", "fetch location reports now", ["retrieve"], None),
-        ("doctor", "account check: known reports return",
-         ["retrieve", "--doctor"], None),
         ("watch", "follow the retrieval worker's log", ["watch"], None),
         ("restart", "stop + start the retrieval worker",
          ["retrieve", "--restart"], None),
@@ -3686,10 +3832,13 @@ MENU_GROUPS = [
         ("pair", "re-pair the connected beacon (new keys)",
          ["pair", "--force"], "console"),
         ("pin", "set a new console PIN", ["pin"], "console"),
-        ("lowbatt", "toggle low-battery mode", ["lowbatt"], "console"),
         ("wipe", "factory reset: erase keys + PIN", ["wipe"], "console"),
     ]),
     ("debug", MAGENTA, [
+        ("doctor", "account check: known reports return",
+         ["retrieve", "--doctor"], None),
+        ("status-debug", "set/poll the OS status bits",
+         ["status-debug"], "console"),
         ("test", "console protocol test suite", ["test"], "console"),
         ("power", "awake/sleep duty cycle", ["power"], "console"),
     ]),
@@ -3938,9 +4087,6 @@ def build_parser() -> argparse.ArgumentParser:
                                                   "prompted when omitted)")
     pair.add_argument("--dbg-sec", type=int, help="console countdown (s, "
                                                    "prompted when omitted)")
-    pair.add_argument("--lomode", type=int, metavar="N",
-                      help="low-battery mode: skip N slots per active slot "
-                           "(0/omitted = off, max 48)")
 
     connect = sub.add_parser("connect", parents=[verbose],
                              help="identify + unlock a beacon over UART")
@@ -3985,18 +4131,13 @@ def build_parser() -> argparse.ArgumentParser:
                           help="scan window in seconds")
     sync_ble.add_argument("--max-slots", type=int, default=None, metavar="N")
 
-    lowbatt = sub.add_parser(
-        "lowbatt", parents=[verbose],
-        help="toggle low-battery mode (skip slots per active slot)")
-    lowbatt.add_argument("state", nargs="?", default="on",
-                         choices=("on", "off", "1", "0"),
-                         help="on/off (default on)")
-    lowbatt.add_argument("slots", nargs="?", type=int, default=0,
-                         help="slots to skip per active slot (1..48, "
-                              "default 1); ignored for 'off'")
-    lowbatt.add_argument("--port")
-    lowbatt.add_argument("--id")
-    lowbatt.add_argument("--pin")
+    sdbg = sub.add_parser(
+        "status-debug", parents=[verbose],
+        help="interactive Debug > Status: toggle the OS status bits and "
+             "push or OS?-poll them to the beacon")
+    sdbg.add_argument("--port")
+    sdbg.add_argument("--id")
+    sdbg.add_argument("--pin")
 
     status = sub.add_parser(
         "status", parents=[verbose],
@@ -4107,7 +4248,7 @@ def build_parser() -> argparse.ArgumentParser:
     log_parser.add_argument("--follow", action="store_true")
 
     for name in ("pair", "sync", "power", "pin", "unlock", "lock", "wipe",
-                 "disconnect", "lowbatt", "status"):
+                 "disconnect", "status-debug", "status"):
         sub.choices[name].add_argument(
             "--reset", action="store_true",
             help="pulse the reset line first (device asleep / no console)")

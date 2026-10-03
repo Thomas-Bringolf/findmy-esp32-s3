@@ -14,6 +14,7 @@
 #include "freertos/task.h"
 
 #include "findmy_keys.h"
+#include "config.h"
 #include "uart_cmd.h"
 
 #define CMD_LINE_MAX 256
@@ -29,6 +30,15 @@ static char cmd_line[CMD_LINE_MAX];
  * (where "remaining" could be days). */
 static RTC_DATA_ATTR uint32_t lock_magic;
 static RTC_DATA_ATTR uint64_t lock_deadline_us;
+
+/* OS-owned advertised status bits (RAM only): powered-on, a user logged in,
+ * internet reachable, plus whether the bits are latched from OS? polls
+ * (poll mode) or set directly. Battery is persisted separately in
+ * findmy_keys (fm_low_battery_on) and drives the skip-slot mechanism. */
+static bool s_os_power = false;
+static bool s_os_login = false;
+static bool s_os_net = false;
+static bool s_os_poll = true;   /* default: a daemon feeds the status */
 
 #define LOCK_MAGIC 0x4C4F4331u
 
@@ -113,16 +123,27 @@ static bool parse_u32(const char *s, uint32_t *out)
     return true;
 }
 
-/* Blocking line reader on stdin; tolerates \r\n and EOF-when-empty.
- * Lines that do not fit are dropped whole (never executed partially). */
-static int read_line(char *buf, size_t n)
+/* Line reader on stdin; tolerates \r\n and EOF-when-empty. Lines that do
+ * not fit are dropped whole (never executed partially). `timeout_ms` bounds
+ * the wait for a complete line (UINT32_MAX = block forever); returns 0 on
+ * timeout with no complete line. The 20 ms EOF poll is kept so the task
+ * sleeps between bytes instead of busy-spinning on the VFS UART. */
+int read_line_timeout(char *buf, size_t n, uint32_t timeout_ms)
 {
     size_t len = 0;
     bool overflow = false;
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t ticks = (timeout_ms == UINT32_MAX)
+                           ? portMAX_DELAY
+                           : pdMS_TO_TICKS(timeout_ms);
 
     for (;;) {
         int c = fgetc(stdin);
         if (c == EOF) {
+            if (timeout_ms != UINT32_MAX &&
+                (int32_t)(xTaskGetTickCount() - (start + ticks)) >= 0) {
+                return 0;   /* no complete line within the budget */
+            }
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
@@ -372,6 +393,163 @@ static void handle_status(void)
           (unsigned)fm_skip_slots());
 }
 
+/* ------------------------------------------------------------------ */
+/* OS status bits: accessors, direct set, OS? poll + latched getter.  */
+/* ------------------------------------------------------------------ */
+
+bool app_os_power(void)      { return s_os_power; }
+bool app_os_login(void)      { return s_os_login; }
+bool app_os_net(void)        { return s_os_net; }
+bool app_os_poll_mode(void)  { return s_os_poll; }
+int  app_os_battery(void)    { return fm_low_battery_on() ? 1 : 0; }
+
+/* Direct set (console/push path): RAM bits are set outright; the battery
+ * flag is persisted to NVS (it drives the skip-slot mechanism) and the
+ * advertised status byte is recomputed + pushed. */
+void app_os_set(int low_batt, int power, int login, int net)
+{
+    bool low = low_batt != 0;
+    if (fm_set_os_battery(low) != 0) {
+        ESP_LOGE(TAG, "OSSTATE: failed to persist battery flag");
+    }
+    s_os_power = power != 0;
+    s_os_login = login != 0;
+    s_os_net = net != 0;
+    app_update_status();
+    ESP_LOGI(TAG, "OS status set directly: batt=%d power=%d login=%d net=%d",
+             low ? 1 : 0, power ? 1 : 0, login ? 1 : 0, net ? 1 : 0);
+}
+
+void app_os_set_poll_mode(bool poll)
+{
+    s_os_poll = poll;
+    ESP_LOGI(TAG, "OS status source: %s",
+             poll ? "poll (OS? replies)" : "direct (OSSTATE)");
+}
+
+/* Parse an `OK OS batt=.. power=.. user=.. net=..` reply into the latch. */
+static int os_parse_reply(const char *line, int *batt, int *power,
+                          int *login, int *net)
+{
+    const char *p = line;
+
+    while (*p) {
+        const char *key;
+        int *dst = NULL;
+        if (strncmp(p, "batt=", 5) == 0)       { key = p + 5; dst = batt; }
+        else if (strncmp(p, "power=", 6) == 0)  { key = p + 6; dst = power; }
+        else if (strncmp(p, "user=", 5) == 0)   { key = p + 5; dst = login; }
+        else if (strncmp(p, "net=", 4) == 0)    { key = p + 4; dst = net; }
+        else { p++; continue; }
+        *dst = (*key == '1') ? 1 : 0;
+        p = key;
+    }
+    return (*batt >= 0 && *power >= 0 && *login >= 0 && *net >= 0) ? 0 : -1;
+}
+
+/* Send one OS? query to the (real or test) daemon. Logged so the poll
+ * cadence is observable on the console. */
+void app_os_poll_request(void)
+{
+    printf("OS?\n");
+    fflush(stdout);
+    ESP_LOGI(TAG, "OS? poll sent");
+}
+
+/* Wait for the daemon's `OK OS ...` reply and latch the OS bits. With no
+ * reply (daemon absent / OS off), power/login/net go to 0 while battery is
+ * left as persisted (a missing reply must not spuriously re-arm cycle-skip,
+ * nor clear a low-battery flag the OS already reported). The reply is logged
+ * either way. */
+int app_os_poll_read(void)
+{
+    char line[CMD_LINE_MAX];
+    int batt = -1, pwr = -1, usr = -1, ntw = -1;
+
+    int len = read_line_timeout(line, sizeof(line), FM_POLL_REPLY_MS);
+    if (len <= 0) {
+        s_os_power = false;
+        s_os_login = false;
+        s_os_net = false;
+        ESP_LOGI(TAG, "OS? poll: no reply, OS bits cleared");
+        return -1;
+    }
+    if (strncmp(line, "OK OS", 5) == 0 &&
+        os_parse_reply(line, &batt, &pwr, &usr, &ntw) == 0) {
+        if (batt >= 0 && fm_set_os_battery(batt != 0) != 0) {
+            ESP_LOGE(TAG, "OS? poll: failed to persist battery flag");
+        }
+        if (pwr >= 0) s_os_power = pwr != 0;
+        if (usr >= 0) s_os_login = usr != 0;
+        if (ntw >= 0) s_os_net = ntw != 0;
+        app_update_status();
+        ESP_LOGI(TAG, "OS? poll: batt=%d power=%d login=%d net=%d",
+                 batt, pwr, usr, ntw);
+        return 0;
+    }
+    /* Unexpected reply line: do not trust it. Log and treat as no reply. */
+    ESP_LOGW(TAG, "OS? poll: unexpected reply '%s'", line);
+    return -1;
+}
+
+int app_os_poll(void)
+{
+    app_os_poll_request();
+    return app_os_poll_read();
+}
+
+/* OS? getter (console side). Reports the currently latched OS state, the
+ * comma-free way that reflects the advertised byte without the parity bit. */
+static void handle_os(void)
+{
+    reply("OS batt=%d power=%d user=%d net=%d",
+          fm_low_battery_on() ? 1 : 0,
+          s_os_power ? 1 : 0,
+          s_os_login ? 1 : 0,
+          s_os_net ? 1 : 0);
+}
+
+static void handle_osstate(char *b, char *p, char *u, char *n)
+{
+    uint32_t batt, power, login, net;
+
+    if (strtok(NULL, " ") != NULL) {
+        reply("ERR ARGS");
+        return;
+    }
+    if (!parse_u32(b, &batt) || batt > 1 ||
+        !parse_u32(p, &power) || power > 1 ||
+        !parse_u32(u, &login) || login > 1 ||
+        !parse_u32(n, &net) || net > 1) {
+        reply("ERR ARGS");
+        return;
+    }
+    app_os_set((int)batt, (int)power, (int)login, (int)net);
+    reply("OK OSSTATE batt=%u power=%u user=%u net=%u",
+          batt, power, login, net);
+}
+
+static void handle_osmode(char *arg)
+{
+    if (strtok(NULL, " ") != NULL) {
+        reply("ERR ARGS");
+        return;
+    }
+    if (arg == NULL) {
+        reply("OSMODE %s", s_os_poll ? "poll" : "direct");
+        return;
+    }
+    if (strcmp(arg, "poll") == 0) {
+        app_os_set_poll_mode(true);
+    } else if (strcmp(arg, "direct") == 0) {
+        app_os_set_poll_mode(false);
+    } else {
+        reply("ERR ARGS");
+        return;
+    }
+    reply("OK OSMODE %s", s_os_poll ? "poll" : "direct");
+}
+
 static void handle_config(char *adv_ms_s, char *rot_sec_s, char *dbg_sec_s)
 {
     uint32_t adv, rot, dbg;
@@ -523,13 +701,23 @@ static void handle_line(char *line)
         handle_ident(strtok(NULL, " "));
         return;
     }
+    /* OS? (getter) is answered even while locked, like IDENT?: it reports
+     * the latched OS state and carries no secret or side effect. */
+    if (strcmp(cmd, "OS?") == 0) {
+        if (strtok(NULL, " ") != NULL) {
+            reply("ERR ARGS");
+            return;
+        }
+        handle_os();
+        return;
+    }
     if (!app_is_unlocked()) {
         reply("LOCKED");
         return;
     }
 
     if (strcmp(cmd, "PING") == 0) {
-        reply("PONG fw=3 paired=%d", fm_is_paired() ? 1 : 0);
+        reply("PONG fw=4 paired=%d", fm_is_paired() ? 1 : 0);
     } else if (strcmp(cmd, "WIPE") == 0) {
         handle_wipe();
     } else if (strcmp(cmd, "KEYS") == 0) {
@@ -564,6 +752,14 @@ static void handle_line(char *line)
         char *a = strtok(NULL, " ");
         char *b = strtok(NULL, " ");
         handle_lowbatt(a, b);
+    } else if (strcmp(cmd, "OSSTATE") == 0) {
+        char *a = strtok(NULL, " ");
+        char *b = strtok(NULL, " ");
+        char *c = strtok(NULL, " ");
+        char *d = strtok(NULL, " ");
+        handle_osstate(a, b, c, d);
+    } else if (strcmp(cmd, "OSMODE") == 0) {
+        handle_osmode(strtok(NULL, " "));
     } else {
         reply("ERR CMD");
     }
@@ -571,10 +767,24 @@ static void handle_line(char *line)
 
 static void uart_cmd_task(void *arg)
 {
+    TickType_t last_poll = xTaskGetTickCount();
+
     for (;;) {
-        int len = read_line(cmd_line, sizeof(cmd_line));
+        /* Read a command line. When the read times out (no host input for
+         * FM_DEBUG_READ_MS) the console is idle, and only then do we run the
+         * debug-session OS? poll - never in the same iteration a command
+         * arrived, so the poll can't read and discard a pending command. */
+        int len = read_line_timeout(cmd_line, sizeof(cmd_line),
+                                    FM_DEBUG_READ_MS);
         if (len > 0) {
             handle_line(cmd_line);
+            continue;
+        }
+        if (app_os_poll_mode() && fm_is_paired() &&
+            (int32_t)(xTaskGetTickCount() - last_poll) >=
+                (int32_t)pdMS_TO_TICKS(FM_DEBUG_POLL_MS)) {
+            last_poll = xTaskGetTickCount();
+            app_os_poll();
         }
     }
 }

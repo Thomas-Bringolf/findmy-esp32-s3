@@ -13,9 +13,9 @@
 #define FM_ADV_MS_MAX   60000   /* 60 s maximum */
 #define FM_ROT_SEC_MIN      1   /* key rotation period bounds; the upper */
 #define FM_ROT_SEC_MAX   86400  /* limit keeps cycles_per_slot() free of overflow */
-#define FM_DBG_SEC_DEFAULT 600
+#define FM_DBG_SEC_DEFAULT 86400   /* 1 day: keep the console reachable long enough to test */
 #define FM_DBG_SEC_MIN      60
-#define FM_DBG_SEC_MAX    3600
+#define FM_DBG_SEC_MAX    86400    /* allow up to 1 day of console before sleeping */
 
 /* Low-battery mode: how many slots are deep-slept after each active slot.
  * Default 1 = skip every other slot; the max caps both the longest sleep
@@ -105,11 +105,16 @@ int fm_set_config(uint32_t adv_ms, uint32_t rot_sec, uint32_t dbg_sec);
 
 /* Low-battery mode: after each active slot the beacon deep-sleeps
  * `fm_skip_slots()` slots. `on` governs whether the mode is engaged (in
- * time, a hardware pin will drive this); `slots` is clamped to 1..
- * FM_SKIP_SLOTS_MAX (0 switches to 1). Persisted in NVS. */
+ * time a hardware pin or the OS-reported battery<20% drives this); `slots`
+ * is clamped to 1..FM_SKIP_SLOTS_MAX (0 switches to 1). Persisted in NVS. */
 bool fm_low_battery_on(void);
 uint32_t fm_skip_slots(void);
 int fm_set_low_battery(bool on, uint32_t slots);
+
+/* Persist the OS-reported battery<20% flag into the low-battery mode
+ * (engaging/disengaging the skip-slot mechanism). Uses the default skip
+ * count. 0 on success, -NVS otherwise. */
+int fm_set_os_battery(bool low);
 
 /* Minimal base64 decoder. Returns decoded length or -1 on error. */
 int fm_base64_decode(const char *src, uint8_t *dst, size_t dst_size);

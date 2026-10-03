@@ -81,8 +81,10 @@ bool app_is_unlocked(void)
     return s_unlocked;
 }
 
-/* Recompute the advertised status byte and push it while advertising. */
-void app_update_status(void)
+/* Compose the 8-bit advertised status byte from the ESP32's own state
+ * (unlocked/config), the OS-reported state (battery via findmy_keys,
+ * power/login/net via uart_cmd) and whole-byte even parity (bit 6). */
+static uint8_t status_compute(void)
 {
     uint8_t status = 0;
 
@@ -95,6 +97,23 @@ void app_update_status(void)
     if (fm_low_battery_on()) {
         status |= FM_STATUS_LOWBATT;
     }
+    if (app_os_power()) {
+        status |= FM_STATUS_POWER;
+    }
+    if (app_os_login()) {
+        status |= FM_STATUS_LOGIN;
+    }
+    if (app_os_net()) {
+        status |= FM_STATUS_NET;
+    }
+    return fm_status_with_parity(status);
+}
+
+/* Recompute the advertised status byte and push it while advertising. */
+void app_update_status(void)
+{
+    uint8_t status = status_compute();
+
     if (adv_data[6] == status) {
         return;
     }
@@ -131,6 +150,44 @@ static uint32_t cycles_per_slot(void)
     if (adv == 0) return 1;
     uint32_t c = (fm_get_rot_sec() * 1000u) / adv;
     return c ? c : 1;
+}
+
+/* Slot-boundary work: poll the OS state (poll mode only) and advance the
+ * key chain. In normal mode the OS? query is sent before the ~2.2 s key
+ * derivation so the daemon's reply is already buffered by the time it is
+ * read - the poll round-trip costs no extra awake time. In low-battery skip
+ * mode there is no derivation to overlap (the new slot's key is computed on
+ * wake), so we send OS?, read the reply and wait out the short round-trip,
+ * then deep-sleep the skipped slots (this function never returns then). */
+static void slot_end(void)
+{
+    const bool lowbat_skip = fm_low_battery_on() && fm_skip_slots() > 0;
+
+    if (app_os_poll_mode()) {
+        app_os_poll_request();
+    }
+
+    if (lowbat_skip) {
+        if (app_os_poll_mode()) {
+            (void)app_os_poll_read();
+        }
+        adv_data[6] = status_compute();
+        rtc_state.i = 0;
+        rtc_state.lowbat_skip = 1;
+        ble_adv_shutdown();
+        enter_deep_sleep((uint64_t)fm_skip_slots() *
+                         (uint64_t)fm_get_rot_sec() * 1000000ULL);
+        /* never returns */
+    }
+
+    if (fm_key_init() == 0 && fm_advance_slot() == 0) {
+        ble_adv_apply_current_key();
+        if (app_os_poll_mode()) {
+            (void)app_os_poll_read();
+        }
+        adv_data[6] = status_compute();
+        rtc_state.i = 0;
+    }
 }
 
 /* Steady-state loop entered after the post-boot debug window: publish one
@@ -177,7 +234,10 @@ static void run_light_sleep_cycle(void)
         /* RTC memory lost (brown-out/battery swap): rebuild from NVS. */
         ble_adv_apply_current_key();
     }
-    adv_data[6] = 0x00;
+    /* Preserve the OS-reported bits carried over from the debug session /
+     * previous wake instead of zeroing them; the steady-state loop keeps
+     * them fresh via the slot-end poll. */
+    adv_data[6] = status_compute();
 
     ble_adv_host_init();
 
@@ -186,26 +246,12 @@ static void run_light_sleep_cycle(void)
 
         ESP_LOGI(LOG_TAG, "PWR wake t=%lld", (long long)t_wake);
 
-        adv_data[6] = fm_low_battery_on() ? FM_STATUS_LOWBATT : 0x00;
+        adv_data[6] = status_compute();
         (void)ble_adv_publish_once();
 
         rtc_state.i++;
         if (rtc_state.i >= cycles_per_slot()) {
-            if (fm_low_battery_on() && fm_skip_slots() > 0) {
-                /* Active slot done: deep-sleep the skipped slots instead of
-                 * deriving their keys - they are batch-advanced on wake. */
-                rtc_state.i = 0;
-                rtc_state.lowbat_skip = 1;
-                ble_adv_shutdown();
-                enter_deep_sleep((uint64_t)fm_skip_slots() *
-                                 (uint64_t)fm_get_rot_sec() * 1000000ULL);
-                /* never returns */
-            }
-            if (fm_key_init() == 0 && fm_advance_slot() == 0) {
-                adv_data[6] = fm_low_battery_on() ? FM_STATUS_LOWBATT : 0x00;
-                ble_adv_apply_current_key();
-                rtc_state.i = 0;
-            }
+            slot_end();
         }
 
         /* Time spent awake since this cycle's wake-up (light-sleep time is

@@ -768,6 +768,11 @@ int fm_set_low_battery(bool on, uint32_t slots)
     return rc;
 }
 
+int fm_set_os_battery(bool low)
+{
+    return fm_set_low_battery(low, FM_SKIP_SLOTS_DEFAULT);
+}
+
 int fm_pair(const uint8_t master[FM_MASTER_LEN],
             const uint8_t skn[FM_SK_LEN])
 {

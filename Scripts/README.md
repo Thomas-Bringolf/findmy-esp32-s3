@@ -68,8 +68,8 @@ nothing until it is reset.
 | `apple-id` | `status` / `connect [apple-id]` / `disconnect` the saved session |
 | `sync` | read the current slot over USB (`SLOT?`/`KEY?`) |
 | `sync-ble` | same, from the BLE advertisement alone (no USB) |
-| `status` | print all device config settings returned by `STATUS?` |
-| `lowbatt` | toggle the beacon's low-battery mode (`on [n]` / `off`) |
+| `status` | print all device config settings returned by `STATUS?` (plus the OS status bits via `OS?`) |
+| `status-debug` | interactive Debug > Status: toggle the OS status bits, push or OS?-poll them |
 | `devices` | list paired devices |
 | `test` | console protocol edge cases (resets the device) |
 | `power` | awake/sleep duty cycle from the `PWR` telemetry |
@@ -196,29 +196,34 @@ powered off, it does not affect sync correctness.
 ./findmy-toolbox.py status --reset         # wake a deep-sleeping beacon first
 ```
 
-Connects, unlocks and runs `STATUS?`, then prints every setting the firmware
-returns: `paired`, `slot`, `debug`, `adv_ms`, `rot_sec`, `dbg_sec` and the
-low-battery mode (`lomode` + `loslots`). A `--reset` pulses the reset line
-first, which is needed when the beacon is deep in a low-battery sleep.
+Connects, unlocks and runs `STATUS?` (and `OS?`), then prints every setting
+the firmware returns: `paired`, `slot`, `debug`, `adv_ms`, `rot_sec`, `dbg_sec`
+and the four OS status bits (battery/power/user/net). A `--reset` pulses the
+reset line first, which is needed when the beacon is deep in a low-battery
+sleep.
 
-### lowbatt
+### status-debug
 
 ```bash
-./findmy-toolbox.py lowbatt on          # default: skip 1 slot per active slot
-./findmy-toolbox.py lowbatt on 3        # skip 3 slots per active slot
-./findmy-toolbox.py lowbatt off         # disable
-./findmy-toolbox.py pair --lomode 1     # enable during pairing (prompted on a TTY)
+./findmy-toolbox.py status-debug            # interactive Debug > Status submenu
 ```
 
-Low-battery mode (`LOWBATT on|off [n]` on the device, `n` clamped to
-1–48). The beacon runs one normal active slot of the light-sleep loop above,
-then **deep sleeps `n` more slot-lengths**, batch-advancing the one-way SK
-chain on wake and deriving the current slot's P-224 key exactly once. This
-drops the idle current to deep-sleep levels (~10 µA) for `n` of every
-`n+1` slots, at the cost of the beacon being off-air during the gap. The
-advertising status byte reports it (`FM_STATUS_LOWBATT`), the deep-sleep gap
-shows as a silence in the `PWR` log between two runs of light cycles, and
-`devices` lists the current skip count in the `lb` column.
+The Debug submenu toggles the four OS status bits (`batt`, `power`, `user`,
+`net`) as `[x]`/`[ ]` checkboxes — never the ESP32-owned bits `unlocked`/
+`config` or the computed parity bit — then writes them to the beacon in one
+of two ways:
+
+- **push**: sends `OSSTATE <batt> <power> <user> <net>` immediately.
+- **os-poll**: switches the beacon to poll mode and awaits its next `OS?`;
+  the toolbox answers it with the selected bits (acting as a stand-in for the
+  real OS daemon) and reads back the latched state to confirm.
+
+The OS bits ride in the advertising status byte (bits 2–5) with whole-byte
+even parity on bit 6. The battery bit is persisted and also drives the skip-
+slot mechanism, so an OS-set low-battery flag makes the beacon deep-sleep
+`FM_SKIP_SLOTS_DEFAULT` more slots per active slot. When poll mode is on, the
+toolbox auto-answers every `OS?` it sees with its current set bits (all `0`
+until the submenu sets them).
 
 ### test
 
@@ -320,19 +325,22 @@ credential-free until the session expires (delete
 ```
 
 `monitor` shows the accessory status byte of the newest report — `0x00
-(locked+sleep-cycle)` green, `UNLOCKED` yellow, `CONFIG` red — then a
-per-bit breakdown: one line for each defined status bit (`unlocked`,
-`config`, `lowbatt`) with its current value and how long it has been in
-that state (a `≥` prefix means the archive only gives a lower bound). Then
+(locked+sleep-cycle)` green, `UNLOCKED` yellow, `CONFIG` red, with the OS
+bits (`batt`/`power`/`user`/`net`) — plus a `PARITY ERROR` tag when the
+byte's even-parity bit disagrees with the rest. Then a per-bit breakdown:
+one line for each defined status bit (`unlocked`, `config`, `batt`, `power`,
+`user`, `net`) with its current value and how long it has been in that state
+(a `≥` prefix means the archive only gives a lower bound). Then
 time since the last report (green ≤ 45 min / yellow ≤ 3 h / red), the
 latest reports with slot, age, position and accuracy, and a per-slot
 coverage strip. The screen is one window frame: title in the top border, the worker
 state, device count and clock on the right of it, the key hints in the
 bottom border. The freshness line carries a progress bar filled relative to
 the 3 h warning threshold, with the percentage next to it. Every fetched
-report archives that byte as `status` plus a decoded
-`status_text`, and the retriever summarises the newest one per device under
-`status` in `state/reports.json`. Only devices that are in
+report archives that byte as `status`, a decoded `status_text`, and a
+`status_parity` (`"ok"`/`"bad"`) marking whether the byte's even-parity bit
+checked out on ingest, and the retriever summarises the newest one per device
+under `status` in `state/reports.json`. Only devices that are in
 `state/devices.json` are listed: archive entries left over from wiped
 devices are collapsed into a single "hidden" count line.
 
@@ -450,8 +458,8 @@ Every entry is always listed, grouped by type and coloured by group:
 | `MONITORING` | cyan | `devices`, `retrieve`, `doctor`, `watch`, `restart`, `monitor`, `log` |
 | `RADIO (BLE)` | blue | `verify`, `scan`, `sync-ble` |
 | `CONSOLE (UART)` | green | `connect`, `disconnect`, `reset`, `sync`, `status`, `unlock`, `lock` |
-| `PROVISIONING` | yellow | `pair`, `pin`, `lowbatt`, `wipe` |
-| `DEBUG` | magenta | `test`, `power` |
+| `PROVISIONING` | yellow | `pair`, `pin`, `wipe` |
+| `DEBUG` | magenta | `doctor`, `status-debug`, `test`, `power` |
 | `APPLE ID` | white | `apple connect`, `apple status`, `apple disconnect` |
 | `SYSTEM` | white | `help` |
 
