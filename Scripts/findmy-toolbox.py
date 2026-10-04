@@ -1665,6 +1665,12 @@ def cmd_test(args) -> int:
         except BeaconError as exc:
             suite.check("UNLOCK correct PIN -> OK UNLOCK", False, str(exc))
             raise
+        # Set a long debug-window so the suite does not race the 60s countdown.
+        # This changes the active dbg_sec timer to 86400s (~24h), keeping the
+        # beacon awake for the entire test.  Without this the 60s window often
+        # expires between the unlock and the first PING, causing failures.
+        reply = beacon.cmd("CONFIG 2000 120 86400")
+        suite.check("CONFIG set dbg_sec=86400 -> OK CONFIG", reply.startswith("OK CONFIG"), reply)
 
         suite.step("P1: protocol and malformed input")
         reply = beacon.cmd("PING")
@@ -1801,6 +1807,12 @@ def cmd_test(args) -> int:
         except BeaconError as exc:
             suite.check("UNLOCK with the new PIN -> OK UNLOCK", False, str(exc))
             raise
+        # Set a long debug-window so the suite does not race the 60s countdown.
+        # This changes the active dbg_sec timer to 86400s (~24h), keeping the
+        # beacon awake for the entire test.  Without this the 60s window often
+        # expires between the unlock and the first PING, causing failures.
+        reply = beacon.cmd("CONFIG 2000 120 86400")
+        suite.check("CONFIG set dbg_sec=86400 -> OK CONFIG", reply.startswith("OK CONFIG"), reply)
 
         suite.step("P3: KEYS, then WIPE = factory reset")
         mk, skn = gen_keys()
@@ -1825,6 +1837,12 @@ def cmd_test(args) -> int:
         except BeaconError as exc:
             suite.check("factory PIN unlocks after WIPE", False, str(exc))
             raise
+        # Set a long debug-window so the suite does not race the 60s countdown.
+        # This changes the active dbg_sec timer to 86400s (~24h), keeping the
+        # beacon awake for the entire test.  Without this the 60s window often
+        # expires between the unlock and the first PING, causing failures.
+        reply = beacon.cmd("CONFIG 2000 120 86400")
+        suite.check("CONFIG set dbg_sec=86400 -> OK CONFIG", reply.startswith("OK CONFIG"), reply)
         reply = beacon.cmd("PING")
         suite.check("unpaired after WIPE", reply.strip().endswith("paired=0"), reply)
         suite.check("SLOT? while unpaired -> ERR UNPAIRED",
@@ -1907,6 +1925,12 @@ def cmd_test(args) -> int:
         except BeaconError as exc:
             suite.check("stored PIN unlocks after the reset", False, str(exc))
             raise
+        # Set a long debug-window so the suite does not race the 60s countdown.
+        # This changes the active dbg_sec timer to 86400s (~24h), keeping the
+        # beacon awake for the entire test.  Without this the 60s window often
+        # expires between the unlock and the first PING, causing failures.
+        reply = beacon.cmd("CONFIG 2000 120 86400")
+        suite.check("CONFIG set dbg_sec=86400 -> OK CONFIG", reply.startswith("OK CONFIG"), reply)
         reply = beacon.cmd("STATUS?")
         suite.check("countdown setting survived", "dbg_sec=60" in reply, reply)
         reply = beacon.cmd("OSSTATE 1 0 0 0")
