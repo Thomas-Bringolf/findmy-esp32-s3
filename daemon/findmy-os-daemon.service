@@ -1,0 +1,23 @@
+[Unit]
+Description=ESP32 Find My beacon OS status daemon
+After=systemd-journald.service
+Wants=systemd-journald.service
+
+[Service]
+# The daemon's normal logs go to stderr, which journald captures, so
+# `systemctl status findmy-os-daemon` and `journalctl -u findmy-os-daemon`
+# both show them. Add `-d`/`-l FILE` to ExecStart below for verbose + file
+# logging (see findmy-os-daemon -h).
+Type=simple
+ExecStart=/usr/local/bin/findmy-os-daemon
+# If it ever dies (even though it is written not to), systemd brings it back.
+Restart=always
+RestartSec=2
+TimeoutStartSec=10
+TimeoutStopSec=3
+KillSignal=SIGTERM
+# Override the serial device per-host if it is not /dev/ttyACM0.
+#Environment=FINDMY_TTY=/dev/ttyACM0
+
+[Install]
+WantedBy=multi-user.target
