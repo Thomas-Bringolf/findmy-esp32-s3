@@ -928,15 +928,21 @@ class Beacon:
             logging.DEBUG)
         return "TIMEOUT"
 
-    def _os_fake_reply(self) -> bytes:
+    def _os_fake_reply(self, reset: bool = False) -> bytes:
         f = _FAKE_OS
-        return (f"OK OS batt={f['batt']} power={f['power']} "
-                f"user={f['user']} net={f['net']}\r\n").encode()
+        payload = (f"OK OS batt={f['batt']} power={f['power']} "
+                   f"user={f['user']} net={f['net']}")
+        if reset:
+            payload += " reset=1"
+        return (payload + "\r\n").encode()
 
-    def respond_to_next_poll(self, timeout: float = 12.0) -> bool:
-        """Block until the ESP32 sends an OS? poll, answer it with the current
-        fake-OS bits, and return True. False on timeout (device not polling,
-        e.g. still in direct mode or asleep)."""
+    def respond_to_next_poll(self, timeout: float = 12.0,
+                             reset: bool = False) -> bool:
+        """Block until the ESP32 sends an OS? poll and answer it. With
+        ``reset`` the reply carries ``reset=1``, which makes the beacon reboot
+        into its debug window (how you wake a sleeping device for flashing).
+        False on timeout (device not polling, e.g. still in direct mode or
+        asleep)."""
         prev = self.s.timeout
         self.s.timeout = 0.05
         try:
@@ -947,9 +953,11 @@ class Beacon:
                     log(self.channel, f"device crashed: {raw.strip()}",
                         logging.ERROR)
                 if raw.strip() == "OS?":
-                    self.s.write(self._os_fake_reply())
+                    self.s.write(self._os_fake_reply(reset=reset))
                     self.s.flush()
-                    log(self.channel, "< auto-answered OS? poll with fake bits",
+                    log(self.channel,
+                        "< auto-answered OS? poll with " +
+                        ("reset=1" if reset else "fake bits"),
                         logging.DEBUG)
                     return True
         finally:
@@ -1101,8 +1109,9 @@ def cmd_pair(args) -> int:
     if args.dbg_sec is not None:
         dbg_sec = args.dbg_sec
     else:
-        dbg_sec = (prompt_int("console countdown in s", 600, 60, 3600, (0,))
-                   if ask else 600)
+        # 0 is not allowed: a boot with no console window is rejected.
+        dbg_sec = (prompt_int("console countdown in s", 86400, 60, 86400)
+                   if ask else 86400)
 
     # From a connection the console stays open (the menu keeps working on
     # it); a plain CLI run locks the device again when it is done.
@@ -1269,17 +1278,29 @@ def cmd_status_debug(args) -> int:
         return 0
 
     try:
-        write = input(p(BOLD, "  write method: [p]ush or [o]s-poll? "))
+        write = input(p(BOLD, "  write method: [p]ush, [o]s-poll, [r]eset? "))
         write = write.strip().lower()
     except (EOFError, KeyboardInterrupt):
         sys.stdout.write(RESET + "\n")
         return 0
     want_poll = write in ("o", "os", "poll", "os-poll")
+    want_reset = write in ("r", "reset", "reboot")
 
     beacon = Beacon(port, pin, dev_id=dev_id, channel=channel,
                     pin_from_flag=args.pin is not None)
     try:
         beacon.after_open(reset=args.reset)
+        if want_reset:
+            # Answer the beacon's next OS? poll with reset=1 so it reboots
+            # into its debug window, making it flash-able again after sleep.
+            beacon.cmd("OSMODE poll")
+            ui("  waiting for the ESP32's next OS? poll to answer with reset=1...")
+            if not beacon.respond_to_next_poll(timeout=12.0, reset=True):
+                raise UserError("no OS? poll within 12 s - is the firmware in "
+                                "poll mode and paired?")
+            ui("  reset requested - the beacon should reboot into its debug "
+               "window now")
+            return 0
         if want_poll:
             # The ESP32 latches these bits from its OS? polls, so we take over
             # the fake-daemon role and answer the next poll with them.
@@ -1308,6 +1329,40 @@ def cmd_status_debug(args) -> int:
         _FAKE_OS.update(bits)
         log(channel, f"pushed OS bits: {bits} -> {reply}")
         ui(f"  pushed OS bits to the beacon: {bits}")
+    finally:
+        beacon.close()
+    return 0
+
+
+def cmd_reset_poll(args) -> int:
+    """Wake a sleeping beacon for flashing.
+
+    A beacon that entered its sleep cycle has no console and its on-chip
+    USB-Serial-JTAG drops off USB, so it can't be reached or flashed. This
+    puts it in poll mode and answers its next OS? status poll with ``reset=1``,
+    which makes it reboot into its debug window (min 60 s) where the console
+    is back and the correct flash reset works again.
+    """
+    channel = _os_channel()
+    data = load_devices()
+    dev_id = pick_device(data, args.id)
+    device = find_device(data, dev_id)
+    port = resolve_port(args.port, device)
+    pin = unlock_pin_for(device, args.pin)
+
+    log(channel, f"'{dev_id}': waiting for an OS? poll to answer with reset=1")
+    ui(f"  waiting for the ESP32's next OS? poll on {port} to answer with "
+       f"reset=1...")
+    beacon = Beacon(port, pin, dev_id=dev_id, channel=channel,
+                    pin_from_flag=args.pin is not None)
+    try:
+        beacon.after_open(reset=args.reset)
+        beacon.cmd("OSMODE poll")
+        if not beacon.respond_to_next_poll(timeout=15.0, reset=True):
+            raise UserError("no OS? poll within 15 s - is the beacon awake and "
+                            "paired? (it must be in a console window to poll)")
+        ui("  reset=1 delivered - the beacon is rebooting into its debug "
+           "window")
     finally:
         beacon.close()
     return 0
@@ -1677,8 +1732,11 @@ def cmd_test(args) -> int:
         suite.check("rot_sec above maximum clamps to 86400",
                     "rot_sec=86400" in reply, reply)
         reply = beacon.cmd("CONFIG 2000 120 5")
-        suite.check("dbg_sec out of range falls back to 600",
-                    "dbg_sec=600" in reply, reply)
+        suite.check("dbg_sec below minimum clamps up to 60",
+                    "dbg_sec=60" in reply, reply)
+        reply = beacon.cmd("CONFIG 2000 120 0")
+        suite.check("dbg_sec 0 is not allowed (clamps to the default)",
+                    "dbg_sec=86400" in reply, reply)
         reply = beacon.cmd("CONFIG 2000 120 600")
         suite.check("config restored to defaults",
                     reply.startswith("OK CONFIG adv_ms=2000 rot_sec=120 dbg_sec=600"),
@@ -3772,6 +3830,7 @@ COMMANDS = {
     "sync": cmd_sync,
     "sync-ble": cmd_sync_ble,
     "status-debug": cmd_status_debug,
+    "reset-poll": cmd_reset_poll,
     "status": cmd_status,
     "devices": cmd_devices,
     "test": cmd_test,
@@ -3792,7 +3851,7 @@ COMMANDS = {
 COMMAND_CHANNEL = {
     "pair": "PAIR", "connect": "CONNECT", "disconnect": "MAIN",
     "reset": "MAIN", "apple-id": "APPLE", "sync": "SYNC", "sync-ble": "SYNC-BLE",
-    "status-debug": "STATUS-DEBUG", "status": "MAIN",
+    "status-debug": "STATUS-DEBUG", "reset-poll": "STATUS-DEBUG", "status": "MAIN",
     "devices": "MAIN", "test": "TEST", "power": "POWER", "retrieve": "RETRIEVE",
     "watch": "RETRIEVE", "monitor": "MONITOR", "verify": "VERIFY", "scan": "SCAN",
     "pin": "MAIN", "unlock": "MAIN", "lock": "MAIN", "wipe": "MAIN",
@@ -3839,6 +3898,8 @@ MENU_GROUPS = [
          ["retrieve", "--doctor"], None),
         ("status-debug", "set/poll the OS status bits",
          ["status-debug"], "console"),
+        ("reset-poll", "wake a sleeping beacon for flashing (OS? reset)",
+         ["reset-poll"], None),
         ("test", "console protocol test suite", ["test"], "console"),
         ("power", "awake/sleep duty cycle", ["power"], "console"),
     ]),
@@ -4139,6 +4200,14 @@ def build_parser() -> argparse.ArgumentParser:
     sdbg.add_argument("--id")
     sdbg.add_argument("--pin")
 
+    rspol = sub.add_parser(
+        "reset-poll", parents=[verbose],
+        help="answer the beacon's next OS? poll with reset=1 so it reboots "
+             "into its debug window (wake a sleeping device for flashing)")
+    rspol.add_argument("--port")
+    rspol.add_argument("--id")
+    rspol.add_argument("--pin")
+
     status = sub.add_parser(
         "status", parents=[verbose],
         help="print the device's config settings (STATUS?)")
@@ -4248,7 +4317,7 @@ def build_parser() -> argparse.ArgumentParser:
     log_parser.add_argument("--follow", action="store_true")
 
     for name in ("pair", "sync", "power", "pin", "unlock", "lock", "wipe",
-                 "disconnect", "status-debug", "status"):
+                 "disconnect", "status-debug", "reset-poll", "status"):
         sub.choices[name].add_argument(
             "--reset", action="store_true",
             help="pulse the reset line first (device asleep / no console)")

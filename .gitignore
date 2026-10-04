@@ -21,3 +21,7 @@ ESP32/sdkconfig.old
 .idea/
 .DS_Store
 *.swp
+
+# daemon build artefact (regenerate with `make` in daemon/)
+daemon/findmy-os-daemon
+daemon/findmy-os-daemon.log

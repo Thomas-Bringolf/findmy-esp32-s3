@@ -485,6 +485,16 @@ int app_os_poll_read(void)
         app_update_status();
         ESP_LOGI(TAG, "OS? poll: batt=%d power=%d login=%d net=%d",
                  batt, pwr, usr, ntw);
+        /* The host can ask for a reboot this way: on the next OS? poll it
+         * answers with reset=1 and the chip restarts into the debug window,
+         * which is what makes it flash-able again after the console slept. */
+        if (strstr(line, "reset=1") != NULL) {
+            ESP_LOGW(TAG, "OS? poll: reset requested - rebooting into "
+                          "the debug window");
+            reply("OK RESET");
+            vTaskDelay(pdMS_TO_TICKS(200));   /* let the reply drain */
+            esp_restart();
+        }
         return 0;
     }
     /* Unexpected reply line: do not trust it. Log and treat as no reply. */

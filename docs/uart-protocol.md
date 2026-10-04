@@ -226,7 +226,10 @@ actually stored:
 |---|---|---|
 | `adv_ms` | 200 … 60000 | nearest bound |
 | `rot_sec` | 1 … 86400 | nearest bound |
-| `dbg_sec` | 60 … 3600 | 600 (the default) |
+| `dbg_sec` | 60 … 86400 | 0 → default (86400); below 60 → 60; above 86400 → 86400 |
+
+A zero/`dbg_sec` is **not** allowed: a boot with no console window would make
+the beacon impossible to flash again, so `0` is pushed up to the default.
 
 Side effects: persisted to NVS, and advertising + the rotation timer are
 restarted. **A `dbg_sec` change only affects the session that starts next**
@@ -285,6 +288,20 @@ them. A missing/timed-out reply clears power/login/net (the OS is off or the
 daemon is gone); battery is left as persisted so a gone daemon cannot
 silently re-arm cycle-skip.
 
+**Reset via OS?** If the reply also carries `reset=1`, the beacon reboots
+into its debug window instead of just latching the bits:
+
+```
+OS?\n
+OK OS batt=0 power=1 user=1 net=1 reset=1\n   -> reboot
+```
+
+This is how a sleeping beacon is woken again for flashing: the on-chip
+USB-Serial-JTAG drops off USB in deep sleep, and once the beacon is in light
+sleep / its console the OS? poll is the only live line to it. The toolbox
+`reset-poll` command does exactly this (it answers the next `OS?` with
+`reset=1`).
+
 **Timing.** In the *debug session* the poll runs on an idle timer
 (`FM_DEBUG_POLL_MS` = 5 s by default) so a host can watch it live. In the
 *steady state* it fires once per **active** slot boundary. On a normal slot
@@ -295,12 +312,12 @@ low-battery skip mode there is no derivation to overlap, so the beacon sends
 Skipped (deep-sleep) slots never poll, which gives the OS daemon a whole
 slot to notice `/dev/ttyACM0` has re-appeared and reconnect.
 
-**Daemon contract.** The OS-side responder (a small C daemon, not built yet)
-owns `/dev/ttyACM0` during the steady state, answers `OS?\n`, and tolerates
-the device dropping off USB during deep sleep (it must re-open the port when
-it re-enumerates). It must ignore every line that is not `OS?` so it never
-steps on the human console. Ownership: the toolbox pauses the daemon while a
-console session is open.
+**Daemon contract.** The OS-side responder is `daemon/findmy-os-daemon.c`
+(built with `make` in `daemon/`, installed as a systemd service). It owns
+`/dev/ttyACM0` in the steady state, answers `OS?\n`, and re-opens the port with
+backoff when it drops off USB during deep sleep. It ignores every line that is
+not `OS?` so it never steps on the human console. Ownership: the toolbox pauses
+the daemon while a console session is open.
 
 ### STAT? / STATUS?
 ```

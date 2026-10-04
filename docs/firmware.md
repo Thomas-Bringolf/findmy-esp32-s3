@@ -64,8 +64,9 @@ no keys, shuts NimBLE down and deep-sleeps for `adv_ms`.
 otherwise it is a fresh boot into a new session (locked again — the lock is
 RAM-only). Inside `run_light_sleep_cycle()` an unpaired device returns
 immediately, which lands it in `run_session()` — that is the config-mode
-fallback after a wake (it also overrides `dbg_sec=0` while unpaired, so the
-console can never become unreachable).
+fallback after a wake, keeping the console reachable (config mode never
+sleeps, and `dbg_sec` can no longer be 0: `clamp_dbg_sec` pushes it up to the
+1-day default, so a boot without a console window is impossible).
 
 **Steady state** (`run_light_sleep_cycle`, paired):
 

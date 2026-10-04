@@ -392,8 +392,12 @@ static uint32_t clamp_rot_sec(uint32_t v)
 
 static uint32_t clamp_dbg_sec(uint32_t v)
 {
-    if (v == 0) return 0;
-    if (v < FM_DBG_SEC_MIN || v > FM_DBG_SEC_MAX) return FM_DBG_SEC_DEFAULT;
+    /* A boot with no console window is not acceptable: 0 disables the debug
+     * session entirely, so it is pushed up to the default. Below the 60 s
+     * minimum clamps up to it; above the max clamps down to it. */
+    if (v == 0) return FM_DBG_SEC_DEFAULT;
+    if (v < FM_DBG_SEC_MIN) return FM_DBG_SEC_MIN;
+    if (v > FM_DBG_SEC_MAX) return FM_DBG_SEC_MAX;
     return v;
 }
 
