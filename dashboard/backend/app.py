@@ -267,6 +267,18 @@ async def fetch_reports(account, acc, dev_id, conn):
 # HTTP JSON API
 # --------------------------------------------------------------------------
 
+# Status‑change labels: when a bit flips on/off we map it to a short phrase.
+STATUS_LABELS = {
+    0x01: 'unlocked',
+    0x02: 'config',
+    0x04: 'low battery',
+    0x08: 'power',
+    0x10: 'login',
+    0x20: 'network',
+    0x40: 'parity',
+}
+
+# --------------------------------------------------------------------------
 class ApiHandler(BaseHTTPRequestHandler):
     def _send(self, code: int, payload):
         body = json.dumps(payload, cls=_JsonEncoder).encode()
@@ -286,6 +298,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.api_statuses()
             elif u.path == "/api/reports":
                 self.api_reports(u.query)
+            elif u.path == "/api/history":
+                self.api_history(u.query)
             else:
                 self._send(404, {"error": "not found"})
         except Exception as exc:
@@ -322,87 +336,86 @@ class ApiHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
-    def api_reports(self, query):
+    # ------------------------------------------------------------------
+    # /api/history — per-device state‑change history.
+    # Walks each device's reports chronologically and emits an event every
+    # time one or more status bits flip.  Returns:
+    #   { device_id: String,
+    #     events: [ { time: ISO-string, changes: [String, ...] } ] }
+    # ------------------------------------------------------------------
+    def api_history(self, query):
         q = parse_qs(query)
-        devices = q.get("device")
-        start = q.get("start", [None])[0]
-        end = q.get("end", [None])[0]
-        limit = min(int(q.get("limit", ["2000"])[0]), 20000)
-
-        where, params = [], []
-        if devices:
-            where.append("device_id = ANY(%s)")
-            params.append(devices)
-        if start:
-            where.append("report_time >= %s")
-            params.append(start)
-        if end:
-            where.append("report_time <= %s")
-            params.append(end)
-
-        sql = ("SELECT id, device_id, slot, report_time, latitude, longitude, "
-               "accuracy_m, confidence, status, status_text, key_hash "
-               "FROM reports")
-        if where:
-            sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY report_time ASC LIMIT %s"
+        device_id = q.get("device", [None])[0]
 
         conn = db_conn()
         try:
+            where = []
+            params = []
+            if device_id:
+                where.append("device_id = %s")
+                params.append(device_id)
+
+            sql = (
+                "SELECT device_id, report_time, status "
+                "FROM reports "
+            )
+            if where:
+                sql += "WHERE " + " AND ".join(where)
+            sql += " ORDER BY device_id, report_time"
+
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(sql, params + [limit])
-                rows = [dict(r) for r in cur.fetchall()]
-            self._send(200, {"reports": rows})
-        finally:
-            conn.close()
+                cur.execute(sql, params)
+                all_rows = cur.fetchall()
 
+            # Group by device
+            by_device = {}
+            for r in all_rows:
+                did = r['device_id']
+                by_device.setdefault(did, []).append({
+                    'time': r['report_time'],
+                    'status': r['status'],
+                })
 
-def start_api():
-    srv = ThreadingHTTPServer(("0.0.0.0", API_PORT), ApiHandler)
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    log.info("API listening on :%d", API_PORT)
-
-
-# --------------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------------
-
-async def main():
-    logging.basicConfig(
-        level=logging.DEBUG if VERBOSE else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    start_api()
-
-    conn = db_conn()
-    account = await load_account()
-    accessories = await fetch_devices(conn)
-    if not accessories:
-        log.warning("no devices in %s", DEVICES_FILE)
-    else:
-        log.info("tracking %d device(s): %s", len(accessories),
-                 ", ".join(accessories))
-
-    try:
-        while True:
-            started = time.time()
-            log.info("fetch cycle start")
-            try:
-                fresh = await fetch_cycle(account, accessories, conn)
-            except Exception as exc:
-                log.error("cycle failed: %s", exc)
-                fresh = 0
-            log.info("cycle done: %d new report(s); next in %.0fs",
-                     fresh, FETCH_INTERVAL)
-            # allow back-to-back fast cycles only if configured tiny
-            await asyncio.sleep(max(5.0, FETCH_INTERVAL - (time.time() - started)))
-    finally:
-        try:
-            await account.close()
-        except Exception:
-            pass
-        conn.close()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+            # Build events per device
+            result = {}
+            for did, rows in by_device.items():
+                events = []
+                prev_status = None
+                for row in rows:
+                    cur_status = row['status']
+                    if prev_status is not None:
+                        changes = []
+                        for bit, label in STATUS_LABELS.items():
+                            bit_prev = prev_status & bit
+                            cur_bit = cur_status & bit
+                            if bit_prev != cur_bit:  # flip
+                                if cur_bit:  # now ON
+                                    # create a descriptive phrase
+                                    if bit == 0x01:
+                                        changes.append('unlocked')
+                                    elif bit == 0x02:
+                                        changes.append('config mode on')
+                                    elif bit == 0x04:
+                                        changes.append('low battery')
+                                    elif bit == 0x08:
+                                        changes.append('power on')
+                                    elif bit == 0x10:
+                                        changes.append('user logged in')
+                                    elif bit == 0x20:
+                                        changes.append('network on')
+                                    elif bit == 0x40:
+                                        changes.append('parity')
+                        if changes:
+                            # format time as ISO string
+                            t = row['report_time']
+                            time_str = t.isoformat() if hasattr(t, 'isoformat') else str(t)
+                            events.append({
+                                'time': time_str,
+                                'changes': changes,
+                            })
+                    prev_status = cur_status
+                result[did] = {'events': events}
+            self._send(200, {"history": result})
+        except Exception as e:
+            log.error("history error: %s", e)
+            self._send(500, {"error": str(e)})

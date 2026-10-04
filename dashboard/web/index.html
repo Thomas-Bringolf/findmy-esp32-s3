@@ -22,11 +22,17 @@
       <select id="device"><option value="">Loading…</option></select>
     </div>
 
-    <!-- Opacity fade slider -->
+    <!-- Fade radio buttons -->
     <div class="field">
-      <label for="fade">Fade dots older than <span id="fadeValue">24h</span></label>
-      <input type="range" id="fade" min="1" max="168" step="1" value="24">
-      <div class="scale"><span>1h</span><span>24h</span><span>168h</span></div>
+      <label>Fade dots older than</label>
+      <div class="radio-group">
+        <label><input type="radio" name="fade" value="1h" checked> 1h</label>
+        <label><input type="radio" name="fade" value="24h"> 24h</label>
+        <label><input type="radio" name="fade" value="168h"> 7d</label>
+        <label><input type="radio" name="fade" value="720h"> 1M</label>
+        <label><input type="radio" name="fade" value="8760h"> 1y</label>
+        <label><input type="radio" name="fade" value="custom" id="fadeCustom"> Custom <input type="text" id="fadeCustomInput" style="display:none;width:80px;" /></label>
+      </div>
     </div>
 
     <!-- Auto refresh -->
@@ -35,25 +41,10 @@
       <button id="refresh" class="ghost">Refresh</button>
     </div>
 
-    <!-- Legend -->
-    <div class="legend">
-      <h3>Status legend</h3>
-      <div class="legend-item">
-        <span class="dot" id="legendFill"></span>
-        <span>Fill = OS running</span>
-      </div>
-      <div class="legend-item">
-        <span class="dot outline" id="legendOutline"></span>
-        <span>Outline = user logged in</span>
-      </div>
-      <div class="legend-item">
-        <span class="dot" style="background:#999;border-color:#333"></span>
-        <span>OS off / user away</span>
-      </div>
-      <div class="legend-item fade">
-        <span class="dot fade-dot"></span>
-        <span>Older dot (fades out)</span>
-      </div>
+    <!-- Device status history -->
+    <div class="field">
+      <h3>Device state</h3>
+      <div id="history" style="max-height:150px;overflow:auto;font-size:12px;"></div>
     </div>
 
     <!-- Device status ledger -->

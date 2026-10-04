@@ -1,22 +1,5 @@
 /* Find My Dashboard — map + controls. */
 
-const STATUS = {
-  UNLOCKED: 0x01,
-  CONFIG:   0x02,
-  LOWBATT:  0x04,
-  POWER:    0x08,   // OS running  -> fill
-  LOGIN:    0x10,   // user logged -> outline
-  NET:      0x20,
-  PARITY:   0x40,
-};
-
-const COLORS = {
-  fillOn:     '#16a34a',
-  fillOff:    '#9aa3ad',
-  outlineOn:  '#2563eb',
-  outlineOff: '#6b7280',
-};
-
 const map = L.map('map').setView([35, 10], 2);
 const cartoKey = window.CARTO_API_KEY || '';
 L.tileLayer('https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png' +
@@ -30,28 +13,40 @@ let allReports = [];
 let knownDevices = [];
 let currentDevice = '';    // '' = all
 
-const fadeInput = document.getElementById('fade');
-const fadeValue = document.getElementById('fadeValue');
-const deviceSel = document.getElementById('device');
-const autoRefresh = document.getElementById('autorefresh');
-const refreshBtn = document.getElementById('refresh');
+/* ----- Device colours ----- */
+let deviceColors = {};
+const PALETTE = [
+  '#16a34a', '#2563eb', '#dc2626', '#ea580c',
+  '#059669', '#7c3aed', '#db2777', '#be185d',
+];
 
-/* Legend preview */
-fixLegend();
-
-function fixLegend() {
-  const fill = document.getElementById('legendFill');
-  const outline = document.getElementById('legendOutline');
-  fill.style.background = COLORS.fillOn;
-  fill.style.borderColor = COLORS.outlineOn;
-  outline.style.background = COLORS.fillOn;
-  outline.style.borderColor = COLORS.outlineOn;
+function getDeviceColor(deviceId) {
+  if (!deviceColors[deviceId]) {
+    const idx = knownDevices.findIndex(d => d.id === deviceId);
+    deviceColors[deviceId] = PALETTE[idx % PALETTE.length];
+  }
+  return deviceColors[deviceId];
 }
 
-async function api(path) {
-  const res = await fetch(path);
-  if (!res.ok) throw new Error('HTTP ' + res.status + ' for ' + path);
-  return res.json();
+/* ----- fade ----- */
+function parseFadeHours(val) {
+  if (val === 'custom') {
+    const input = document.getElementById('fadeCustomInput').value.trim();
+    const re = /(\d+)([YyMmDdHhMm])/g;
+    let totalHours = 0;
+    let m;
+    while ((m = re.exec(input)) !== null) {
+      const n = parseInt(m[1], 10);
+      const u = m[2].toLowerCase();
+      if (u === 'y') totalHours += n * 365 * 24;
+      else if (u === 'm') totalHours += n * 30 * 24;
+      else if (u === 'd') totalHours += n * 24;
+      else if (u === 'h') totalHours += n;
+      else if (u === 'min') totalHours += n / 60;
+    }
+    return totalHours >= 0 ? totalHours : 168;
+  }
+  return parseInt(val, 10) || 168;
 }
 
 function fmtAge(iso) {
@@ -64,37 +59,38 @@ function fmtAge(iso) {
   return (sec / 86400).toFixed(1) + 'd';
 }
 
-/* ---- devices / ledger ---- */
+/* ----- api ----- */
+async function api(path) {
+  const res = await fetch(path);
+  if (!res.ok) throw new Error('HTTP ' + res.status + ' for ' + path);
+  return res.json();
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({'&':'&','<':'<','>':'>','"':'"',"'":'''}[c]));
+}
+
+/* ----- devices / ledger ----- */
 async function loadDevices() {
   const data = await api('/api/devices');
   knownDevices = data.devices || [];
-  const prev = deviceSel.value;
-  deviceSel.innerHTML = '<option value="">All devices</option>'
+  const prev = document.getElementById('device').value;
+  const sel = document.getElementById('device');
+  sel.innerHTML = '<option value="">All devices</option>'
     + knownDevices.map(d => `<option value="${esc(d.id)}">${esc(d.id)}</option>`).join('');
-  if (prev) deviceSel.value = prev;
+  if (prev) sel.value = prev;
 }
 
-async function loadStatus() {
-  const data = await api('/api/status');
-  const rows = data.statuses || [];
-  const tbody = document.getElementById('ledgerBody');
-  tbody.innerHTML = rows.length ? rows.map(st => `
-    <tr>
-      <td>${esc(st.device_id)}</td>
-      <td>${fmtAge(st.report_time)}</td>
-      <td>${statusBadge(st.status)}</td>
-    </tr>`).join('')
-    : '<tr><td colspan="3">No reports yet</td></tr>';
-}
-
+/* ----- status badge (kept for ledger) ----- */
 function statusBadge(st) {
-  const running = (st & STATUS.POWER) ? 'on' : 'off';
-  const login = (st & STATUS.LOGIN) ? 'on' : 'off';
+  const running = !!(st & 0x08);
+  const login = !!(st & 0x10);
   return `<span class="badge ${running}">OS ${running}</span> ` +
          `<span class="badge ${login}">user ${login}</span>`;
 }
 
-/* ---- reports / map ---- */
+/* ----- reports / map ----- */
 async function loadReports() {
   const q = currentDevice ? '?device=' + encodeURIComponent(currentDevice) : '';
   const data = await api('/api/reports' + q);
@@ -102,16 +98,57 @@ async function loadReports() {
   draw();
 }
 
-function esc(s) {
-  return String(s).replace(/[&<>"']/g, c =>
-    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+/* ----- history ----- */
+async function loadHistory() {
+  const deviceId = currentDevice || '';
+  const data = await api('/api/history' + (deviceId ? '?device=' + encodeURIComponent(deviceId) : ''));
+  const historyDiv = document.getElementById('history');
+  if (!data || !data.history) {
+    historyDiv.innerHTML = '<p>No history yet</p>';
+    return;
+  }
+
+  // Render for the selected device (or all if 'All devices')
+  const entries = data.history[deviceId] ? data.history[deviceId].events : [];
+  // Also show if all devices: combine
+  let html = '';
+  if (currentDevice === '') {
+    // Show all devices' events, grouped
+    const allEvents = [];
+    for (const did of Object.keys(data.history)) {
+      const evts = data.history[did].events || [];
+      for (const e of evts) allEvents.push({ time: e.time, changes: e.changes, device: did });
+    }
+    // Sort newest first
+    allEvents.sort((a, b) => new Date(b.time) - new Date(a.time));
+    for (const e of allEvents.slice(0, 20)) {
+      const age = fmtAge(e.time);
+      const changesTxt = e.changes.join(', ') || '—';
+      html += `<p><span class="time">${age} ago</span> <span class="changes">${changesTxt}</span> <span class="device">device ${esc(e.device)}</span></p>`;
+    }
+    if (allEvents.length === 0) html = '<p>No state changes yet</p>';
+    if (allEvents.length > 20) html += '<p><small>… showing newest 20</small></p>';
+  } else {
+    const evts = entries || [];
+    evts.sort((a, b) => new Date(b.time) - new Date(a.time));
+    for (const e of evts.slice(0, 20)) {
+      const age = fmtAge(e.time);
+      const changesTxt = e.changes.join(', ') || '—';
+      html += `<p><span class="time">${age} ago</span> <span class="changes">${changesTxt}</span></p>`;
+    }
+    if (evts.length === 0) html = '<p>No state changes yet</p>';
+    if (evts.length > 20) html += '<p><small>… showing newest 20</small></p>';
+  }
+  historyDiv.innerHTML = html;
 }
 
+/* ----- draw map ----- */
 function draw() {
   markers.forEach(m => { try { m.remove(); } catch (e) {} });
   markers = [];
 
-  const fadeHours = Number(fadeInput.value);
+  const fadeVal = document.querySelector('input[name="fade"]:checked').value;
+  const fadeHours = parseFadeHours(fadeVal);
   const now = Date.now();
 
   for (const r of allReports) {
@@ -120,56 +157,73 @@ function draw() {
     const t = new Date(r.report_time).getTime();
     const ageHours = (now - t) / 3600000;
 
-    /* Opacity: 100% when fresh, 0% when older than the fade slider. */
+    /* Opacity: 100% when fresh, 0% when older than fade threshold. */
     const opacity = fadeHours <= 0 ? 1 : Math.max(0, 1 - ageHours / fadeHours);
 
-    const running = !!(r.status & STATUS.POWER);
-    const login = !!(r.status & STATUS.LOGIN);
-    const fill = running ? COLORS.fillOn : COLORS.fillOff;
-    const outline = login ? COLORS.outlineOn : COLORS.outlineOff;
+    const deviceId = r.device_id;
+    const color = getDeviceColor(deviceId);
 
     const circle = L.circleMarker([r.latitude, r.longitude], {
       radius: 8,
-      color: outline,
+      color: color,
       weight: 3,
-      fillColor: fill,
+      fillColor: color,
       fillOpacity: opacity,
       opacity: opacity,
     }).bindPopup(
       `<b>${esc(r.device_id)}</b><br>` +
-      `slot ${r.slot}<br>${esc(fmtAge(r.report_time))} ago<br>` +
-      `OS <b>${running ? 'running' : 'off'}</b>, user <b>${login ? 'in' : 'out'}</b>`
+      `slot ${r.slot}<br>${esc(fmtAge(r.report_time))} ago`
     );
     markers.push(circle.addTo(map));
   }
 }
 
-/* ---- events ---- */
-deviceSel.addEventListener('change', () => {
-  currentDevice = deviceSel.value;
+/* ----- events ----- */
+document.getElementById('device').addEventListener('change', () => {
+  currentDevice = document.getElementById('device').value;
   loadReports().catch(err => console.error(err));
+  loadHistory().catch(err => console.error(err));
 });
 
-fadeInput.addEventListener('input', () => {
-  fadeValue.textContent = fadeInput.value + 'h';
+document.querySelectorAll('input[name="fade"]').forEach(radio => {
+  radio.addEventListener('change', () => {
+    if (radio.value === 'custom') {
+      document.getElementById('fadeCustomInput').style.display = 'inline';
+      radio.checked = true;
+    } else {
+      document.getElementById('fadeCustomInput').style.display = 'none';
+      document.getElementById('fadeCustomInput').value = '';
+    }
+    const fadeHours = parseFadeHours(radio.value);
+    document.getElementById('fadeValue').textContent = radio.value === 'custom'
+      ? (isNaN(parseFadeHours(radio.value)) ? '168h' : parseFadeHours(radio.value) + 'h')
+      : radio.value;
+    draw();
+  });
+});
+
+document.getElementById('fadeCustomInput').addEventListener('input', () => {
+  const val = document.getElementById('fadeCustomInput').value;
+  document.getElementById('fadeValue').textContent = val + 'h';
   draw();
 });
 
-refreshBtn.addEventListener('click', async () => {
-  await Promise.all([loadDevices(), loadStatus(), loadReports()]).catch(console.error);
+document.getElementById('refreshBtn').addEventListener('click', async () => {
+  await Promise.all([loadDevices(), loadStatus(), loadReports(), loadHistory()]).catch(console.error);
 });
 
 setInterval(() => {
-  if (autoRefresh.checked) {
+  if (document.getElementById('autorefresh').checked) {
     loadStatus().catch(console.error);
     loadReports().catch(console.error);
+    loadHistory().catch(console.error);
   }
 }, 30000);
 
-/* ---- init ---- */
+/* ----- init ----- */
 (async function init() {
   try {
-    await Promise.all([loadDevices(), loadStatus(), loadReports()]);
+    await Promise.all([loadDevices(), loadStatus(), loadReports(), loadHistory()]);
   } catch (e) {
     console.error('init failed', e);
     document.getElementById('ledgerBody').innerHTML =
