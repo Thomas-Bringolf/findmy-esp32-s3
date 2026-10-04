@@ -14,6 +14,7 @@
 #include "uart_cmd.h"
 #include "config.h"
 #include "beacon.h"
+#define DBG_POWER_LOGS 1
 
 static const char *LOG_TAG = "open_haystack";
 
@@ -244,7 +245,9 @@ static void run_light_sleep_cycle(void)
     while (1) {
         const int64_t t_wake = esp_timer_get_time();
 
+#if DBG_POWER_LOGS
         ESP_LOGI(LOG_TAG, "PWR wake t=%lld", (long long)t_wake);
+#endif
 
         adv_data[6] = status_compute();
         (void)ble_adv_publish_once();
@@ -266,7 +269,9 @@ static void run_light_sleep_cycle(void)
             sleep_us = FM_MIN_SLEEP_US;
         }
 
+#if DBG_POWER_LOGS
         ESP_LOGI(LOG_TAG, "PWR sleep awake_us=%lld sleep_us=%llu",
+#endif
                  (long long)awake_us, (unsigned long long)sleep_us);
         enter_light_sleep(sleep_us);
     }
