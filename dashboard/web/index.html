@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Find My Dashboard</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="panel">
+    <h1>Find My Dashboard</h1>
+
+    <!-- Device selector -->
+    <div class="field">
+      <label for="device">Device</label>
+      <select id="device"><option value="">Loading…</option></select>
+    </div>
+
+    <!-- Opacity fade slider -->
+    <div class="field">
+      <label for="fade">Fade dots older than <span id="fadeValue">24h</span></label>
+      <input type="range" id="fade" min="1" max="168" step="1" value="24">
+      <div class="scale"><span>1h</span><span>24h</span><span>168h</span></div>
+    </div>
+
+    <!-- Auto refresh -->
+    <div class="field row">
+      <label class="checkbox"><input type="checkbox" id="autorefresh" checked> Auto-refresh (30s)</label>
+      <button id="refresh" class="ghost">Refresh</button>
+    </div>
+
+    <!-- Legend -->
+    <div class="legend">
+      <h3>Status legend</h3>
+      <div class="legend-item">
+        <span class="dot" id="legendFill"></span>
+        <span>Fill = OS running</span>
+      </div>
+      <div class="legend-item">
+        <span class="dot outline" id="legendOutline"></span>
+        <span>Outline = user logged in</span>
+      </div>
+      <div class="legend-item">
+        <span class="dot" style="background:#999;border-color:#333"></span>
+        <span>OS off / user away</span>
+      </div>
+      <div class="legend-item fade">
+        <span class="dot fade-dot"></span>
+        <span>Older dot (fades out)</span>
+      </div>
+    </div>
+
+    <!-- Device status ledger -->
+    <div class="ledger">
+      <h3>Device status</h3>
+      <table id="ledgerTable">
+        <thead><tr><th>Device</th><th>Last seen</th><th>Status</th></tr></thead>
+        <tbody id="ledgerBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

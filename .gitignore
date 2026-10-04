@@ -25,3 +25,13 @@ ESP32/sdkconfig.old
 # daemon build artefact (regenerate with `make` in daemon/)
 daemon/findmy-os-daemon
 daemon/findmy-os-daemon.log
+
+# ------------------------------------------------------------------
+# dashboard/ — secrets and generated files must NOT be committed.
+# config.js holds the Carto map API key; keep the committed
+# config.example.js as the template instead.
+# ------------------------------------------------------------------
+dashboard/web/config.js
+dashboard/.env
+dashboard/backend/__pycache__/
+docker-compose.yml

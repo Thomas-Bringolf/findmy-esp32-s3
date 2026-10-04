@@ -1,0 +1,105 @@
+:root {
+  --panel: #ffffff;
+  --bg: #f4f6f8;
+  --text: #1f2430;
+  --muted: #6b7480;
+  --accent: #2563eb;
+  --border: #e3e7ec;
+  --fill-on: #16a34a;   /* OS running */
+  --fill-off: #9aa3ad;  /* OS off */
+  --outline-on: #2563eb;/* user logged in */
+  --outline-off: #6b7280;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0; height: 100%;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+#map {
+  position: absolute; inset: 0;
+  z-index: 1;
+}
+
+#panel {
+  position: absolute;
+  top: 12px; right: 12px; bottom: 12px;
+  width: 300px;
+  z-index: 2;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 8px 30px rgba(0,0,0,.12);
+  padding: 18px;
+  overflow-y: auto;
+  font-size: 13px;
+}
+
+#panel h1 {
+  font-size: 17px; font-weight: 700; margin: 0 0 14px;
+  letter-spacing: -.2px;
+}
+
+.field { margin-bottom: 14px; }
+.field label { display: block; font-weight: 600; margin-bottom: 6px; }
+
+select, button {
+  font: inherit;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+}
+button.ghost { width: auto; cursor: pointer; background: #f8fafc; }
+button.ghost:hover { background: #eef2f7; }
+
+.field.row {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+}
+.field.row label.checkbox { display: flex; align-items: center; gap: 8px; margin: 0; font-weight: 500; }
+.field.row button { width: auto; }
+
+.scale { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; margin-top: 4px; }
+
+.legend, .ledger {
+  border-top: 1px solid var(--border);
+  margin-top: 12px; padding-top: 12px;
+}
+.legend h3, .ledger h3 {
+  font-size: 12px; text-transform: uppercase; letter-spacing: .6px;
+  color: var(--muted); margin: 0 0 8px;
+}
+.legend-item { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+.legend-item.fade { color: var(--muted); }
+
+.dot {
+  display: inline-block;
+  width: 14px; height: 14px; border-radius: 50%;
+  border: 3px solid;
+  flex: none;
+}
+.dot.outline { border: 3px solid var(--outline-on); background: var(--fill-on); }
+.fade-dot { background: var(--fill-on); border-color: var(--outline-on); opacity: .3; }
+
+#ledgerTable { width: 100%; border-collapse: collapse; }
+#ledgerTable th {
+  text-align: left; font-size: 11px; text-transform: uppercase;
+  letter-spacing: .5px; color: var(--muted); padding: 4px 2px;
+}
+#ledgerTable td { padding: 6px 2px; border-top: 1px solid var(--border); vertical-align: top; }
+#ledgerTable td:last-child { white-space: nowrap; }
+
+.badge {
+  display: inline-block; padding: 1px 7px; border-radius: 10px;
+  background: #eef2f7; color: #333; font-size: 11px;
+}
+.badge.on { background: #dcfce7; color: #15803d; }
+.badge.off { background: #fee2e2; color: #b91c1c; }
+
+/* Leaflet marker tweaks: dots are circleMarkers so colours come via options. */
+.leaflet-container { font-family: 'Inter', sans-serif; }
