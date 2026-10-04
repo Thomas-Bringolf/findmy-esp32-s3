@@ -19,10 +19,9 @@ const COLORS = {
 
 const map = L.map('map').setView([35, 10], 2);
 const cartoKey = window.CARTO_API_KEY || '';
-L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png' +
-            (cartoKey ? '?api_key=' + cartoKey : ''), {
+L.tileLayer('https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png' +
+            (cartoKey ? '?key=' + cartoKey : ''), {
   attribution: '&copy; OpenStreetMap &copy; CARTO',
-  subdomains: 'abcd',
   maxZoom: 19,
 }).addTo(map);
 
