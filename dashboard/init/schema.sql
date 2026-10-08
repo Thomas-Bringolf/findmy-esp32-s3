@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS devices (
     master_key  TEXT,                      -- base64
     skn         TEXT,                      -- base64
     slot_seconds INTEGER,
+    slot_synced_at TIMESTAMPTZ,                -- when last_known_slot was valid
     last_known_slot INTEGER,
     adv_ms      INTEGER,
     rot_sec     INTEGER,
@@ -38,6 +39,15 @@ CREATE TABLE IF NOT EXISTS reports (
     key_hash      TEXT,
     retrieved_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (device_id, slot)
+);
+
+-- Manual slot corrections made from the dashboard (the backend host has no
+-- Bluetooth, so it cannot sync the beacon's slot counter by itself).
+CREATE TABLE IF NOT EXISTS slot_overrides (
+    device_id  TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+    slot       INTEGER NOT NULL,               -- slot the beacon was at
+    synced_at  TIMESTAMPTZ NOT NULL,           -- when it was at that slot
+    set_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_reports_device_time

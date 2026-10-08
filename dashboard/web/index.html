@@ -32,6 +32,7 @@
         <label><input type="radio" name="fade" value="720h"> 1M</label>
         <label><input type="radio" name="fade" value="8760h"> 1y</label>
         <label><input type="radio" name="fade" value="custom" id="fadeCustom"> Custom <input type="text" id="fadeCustomInput" style="display:none;width:80px;" /></label>
+        <span id="fadeValue"></span>
       </div>
     </div>
 
@@ -39,6 +40,18 @@
     <div class="field row">
       <label class="checkbox"><input type="checkbox" id="autorefresh" checked> Auto-refresh (30s)</label>
       <button id="refresh" class="ghost">Refresh</button>
+    </div>
+
+    <!-- Manual slot sync -->
+    <div class="field">
+      <h3 class="section-title">Slot sync</h3>
+      <div id="slotInfo">—</div>
+      <div class="row slot-row">
+        <input type="number" id="slotInput" min="0" step="1" placeholder="slot #" />
+        <button id="slotSet" class="ghost" disabled>Set</button>
+        <button id="slotClear" class="ghost" disabled title="Remove manual override">Clear</button>
+      </div>
+      <p class="hint">This server has no Bluetooth, so it cannot sync the beacon's rotating-key slot by itself. If reports stop appearing, set the current slot manually (e.g. from <code>pair_device.py --sync</code> on a machine with BLE).</p>
     </div>
 
     <!-- Device status history -->
